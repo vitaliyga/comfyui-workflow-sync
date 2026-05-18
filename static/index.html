@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>ComfyUI S3 Sync</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.4 -apple-system, system-ui, sans-serif; background:#111; color:#ddd; margin:0; padding:24px; }
+  h1 { font-size:18px; margin:0 0 16px; }
+  h2 { font-size:14px; margin:24px 0 8px; color:#9cf; }
+  #drop {
+    border:2px dashed #555; border-radius:8px; padding:40px; text-align:center;
+    color:#888; cursor:pointer; transition:.15s;
+  }
+  #drop:hover, #drop.hover { border-color:#9cf; color:#9cf; background:#1a2230; }
+  #drop small { display:block; color:#666; margin-top:6px; font-size:11px; }
+  tr.notfound td.status { color:#fc6; }
+  .candidates { margin-top:4px; font-size:11px; color:#bbb; }
+  .candidates .head { color:#888; margin-bottom:2px; }
+  .candidates a {
+    display:block; color:#9cf; cursor:pointer; text-decoration:underline;
+    padding:1px 0;
+  }
+  #files {
+    margin-top:12px; padding:8px 12px; background:#1a1a1a; border-radius:4px;
+    font: 12px ui-monospace, Menlo, monospace; color:#9cf;
+  }
+  #files .label { color:#888; margin-right:8px; }
+  #files .chip {
+    display:inline-block; background:#222; border-radius:3px;
+    padding:2px 8px; margin:2px 4px 2px 0;
+  }
+  table { border-collapse: collapse; width:100%; margin-top:8px; }
+  th, td { text-align:left; padding:6px 10px; border-bottom:1px solid #222; font-size:13px; vertical-align:top; }
+  th { color:#888; font-weight:500; }
+  tr.missing td.status { color:#f66; }
+  tr.ok td.status { color:#6c6; }
+  tr.unknown td.status { color:#fc6; }
+  code { font: 12px ui-monospace, Menlo, monospace; color:#9cf; word-break:break-all; }
+  .size { font: 12px ui-monospace, Menlo, monospace; color:#bbb; white-space:nowrap; }
+  .size .pending { color:#666; }
+  .progress {
+    display:block; width:100%; height:4px; background:#222; border-radius:2px;
+    margin-top:4px; overflow:hidden;
+  }
+  .progress > div { height:100%; background:#2a5; width:0; transition: width .3s; }
+  button {
+    background:#2a5; color:#fff; border:0; border-radius:4px;
+    padding:8px 16px; font-size:13px; cursor:pointer; margin-top:12px; margin-right:8px;
+  }
+  button:disabled { background:#444; cursor:not-allowed; }
+  button.secondary { background:#36c; }
+  #total { margin-top:12px; color:#9cf; font-size:13px; }
+  #console {
+    background:#000; color:#9f9; font: 12px ui-monospace, Menlo, monospace;
+    padding:12px; margin-top:12px; border-radius:4px;
+    max-height:400px; overflow:auto; white-space:pre-wrap; display:none;
+  }
+  .meta { color:#777; font-size:12px; margin-bottom:16px; }
+</style>
+</head>
+<body>
+<h1>ComfyUI S3 Sync</h1>
+<div class="meta" id="meta">…</div>
+<div id="drop">
+  Drop workflow .json files here, or click to choose
+  <small>multiple files supported — deps will be merged</small>
+</div>
+<input type="file" id="file-input" accept=".json,application/json" multiple style="display:none" />
+
+<div id="files" style="display:none"></div>
+
+<div id="results" style="display:none">
+  <h2>Models</h2>
+  <table id="models-table">
+    <thead><tr><th style="width:24px"></th><th>File</th><th>Folder</th><th>Status</th><th>Size</th><th>S3 source</th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <h2>Custom Nodes</h2>
+  <table id="nodes-table">
+    <thead><tr><th style="width:24px"></th><th>Node type</th><th>Package</th><th>Status</th><th>Size</th><th>S3 source</th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <div id="total"></div>
+  <button id="select-all-btn" class="secondary">Select All</button>
+  <button id="clear-all-btn" class="secondary">Clear All</button>
+  <button id="sync-btn">Sync Selected</button>
+  <button id="reanalyze-btn" class="secondary" style="display:none">Re-analyze</button>
+</div>
+
+<pre id="console"></pre>
+
+<script>
+let lastAnalysis = null;
+let lastWorkflows = [];
+// s3_source -> { bytes, files, candidates }
+const sizeCache = {};
+// s3_source -> overridden s3_source (when user picks a candidate)
+const overrides = {};
+// item rows by item_index during sync
+let syncRows = [];
+
+const drop = document.getElementById('drop');
+const meta = document.getElementById('meta');
+const results = document.getElementById('results');
+const modelsBody = document.querySelector('#models-table tbody');
+const nodesBody = document.querySelector('#nodes-table tbody');
+const totalEl = document.getElementById('total');
+const syncBtn = document.getElementById('sync-btn');
+const reBtn = document.getElementById('reanalyze-btn');
+const cons = document.getElementById('console');
+
+fetch('/status').then(r=>r.json()).then(s=>{
+  meta.textContent = `ComfyUI: ${s.comfyui_path} · ${s.custom_nodes.length} custom nodes installed · downloader: aws s3 sync`;
+});
+
+const fileInput = document.getElementById('file-input');
+
+['dragenter','dragover'].forEach(ev =>
+  drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('hover'); }));
+['dragleave','drop'].forEach(ev =>
+  drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('hover'); }));
+
+drop.addEventListener('click', () => fileInput.click());
+
+drop.addEventListener('drop', e => handleFiles(e.dataTransfer.files));
+fileInput.addEventListener('change', e => handleFiles(e.target.files));
+
+async function handleFiles(fileList) {
+  const files = Array.from(fileList).filter(f => f.name.endsWith('.json'));
+  if (!files.length) return;
+  const workflows = [];
+  const names = [];
+  for (const f of files) {
+    try { workflows.push(JSON.parse(await f.text())); names.push(f.name); }
+    catch { alert(`not valid JSON: ${f.name}`); return; }
+  }
+  fileInput.value = '';
+  showFiles(names);
+  await analyzeAll(workflows);
+}
+
+function showFiles(names) {
+  const el = document.getElementById('files');
+  el.style.display = '';
+  el.innerHTML = `<span class="label">Loaded (${names.length}):</span>` +
+    names.map(n => `<span class="chip">${escape(n)}</span>`).join('');
+}
+
+async function analyzeAll(workflows) {
+  lastWorkflows = workflows;
+  const analyses = await Promise.all(workflows.map(wf =>
+    fetch('/analyze', {
+      method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({ workflow: wf })
+    }).then(r => r.json())
+  ));
+  lastAnalysis = mergeAnalyses(analyses);
+  render();
+  await fetchSizes();
+}
+
+function mergeAnalyses(list) {
+  const models = new Map();   // key: folder|file
+  const nodes = new Map();    // key: package_hint || node_type
+  for (const a of list) {
+    for (const m of a.models) {
+      models.set(`${m.folder}|${m.file}`, m);
+    }
+    for (const n of a.custom_nodes) {
+      const k = n.package_hint || `__unknown__${n.node_type}`;
+      if (!nodes.has(k)) nodes.set(k, n);
+    }
+  }
+  return { models: [...models.values()], custom_nodes: [...nodes.values()] };
+}
+
+function humanBytes(n) {
+  if (n == null) return '—';
+  if (n === 0) return '0 B';
+  const u = ['B','KiB','MiB','GiB','TiB'];
+  const i = Math.min(u.length-1, Math.floor(Math.log(n) / Math.log(1024)));
+  return (n / Math.pow(1024, i)).toFixed(i ? 2 : 0) + ' ' + u[i];
+}
+
+function checkboxCell(syncable) {
+  return syncable
+    ? '<td><input type="checkbox" class="pick" checked></td>'
+    : '<td></td>';
+}
+
+function render() {
+  modelsBody.innerHTML = '';
+  for (const m of lastAnalysis.models) {
+    const tr = document.createElement('tr');
+    tr.className = m.exists_locally ? 'ok' : 'missing';
+    tr.dataset.src = m.s3_source || '';
+    const status = m.exists_locally ? '✅ OK' : '🔴 Missing';
+    const syncable = !m.exists_locally && !!m.s3_source;
+    tr.innerHTML = `
+      ${checkboxCell(syncable)}
+      <td>${escape(m.file)}</td>
+      <td>${escape(m.folder)}</td>
+      <td class="status">${status}</td>
+      <td class="size">${m.exists_locally ? '—' : '<span class="pending">…</span>'}</td>
+      <td><code>${m.exists_locally ? '—' : escape(m.s3_source || '')}</code></td>`;
+    modelsBody.appendChild(tr);
+  }
+  nodesBody.innerHTML = '';
+  for (const n of lastAnalysis.custom_nodes) {
+    const tr = document.createElement('tr');
+    tr.className = n.status;
+    tr.dataset.src = n.s3_source || '';
+    let status = '❓ Unknown';
+    if (n.status === 'ok') status = '✅ OK';
+    else if (n.status === 'missing') status = '🔴 Missing';
+    const syncable = n.status === 'missing' && !!n.s3_source;
+    const sizeCell = syncable ? '<span class="pending">…</span>' : '—';
+    const note = n.status === 'unknown' ? '<code>not in config</code>' :
+                 (n.exists_locally ? '<code>—</code>' : `<code>${escape(n.s3_source || '')}</code>`);
+    tr.innerHTML = `
+      ${checkboxCell(syncable)}
+      <td>${escape(n.node_type)}</td>
+      <td>${escape(n.package_hint || '—')}</td>
+      <td class="status">${status}</td>
+      <td class="size">${sizeCell}</td>
+      <td>${note}</td>`;
+    nodesBody.appendChild(tr);
+  }
+  bindPicks();
+  results.style.display = '';
+  reBtn.style.display = 'none';
+  syncBtn.disabled = false;
+  cons.style.display = 'none';
+  cons.textContent = '';
+  totalEl.textContent = '';
+}
+
+async function fetchSizes() {
+  const sources = [];
+  for (const m of lastAnalysis.models) {
+    if (!m.exists_locally && m.s3_source) sources.push(m.s3_source);
+  }
+  for (const n of lastAnalysis.custom_nodes) {
+    if (n.status === 'missing' && n.s3_source) sources.push(n.s3_source);
+  }
+  if (!sources.length) {
+    totalEl.textContent = 'Nothing to download.';
+    return;
+  }
+  const r = await fetch('/size', {
+    method:'POST', headers:{'content-type':'application/json'},
+    body: JSON.stringify({ sources })
+  });
+  const { sizes } = await r.json();
+  Object.assign(sizeCache, sizes);
+  for (const [src, info] of Object.entries(sizes)) {
+    const row = document.querySelector(`tr[data-src="${cssEscape(src)}"]`);
+    if (!row) continue;
+    const cell = row.querySelector('.size');
+    const statusCell = row.querySelector('.status');
+    cell.innerHTML = '';
+    if (info.bytes != null) {
+      cell.textContent = humanBytes(info.bytes) + (info.files > 1 ? ` (${info.files} files)` : '');
+    } else if (info.candidates && info.candidates.length) {
+      row.classList.remove('missing');
+      row.classList.add('notfound');
+      statusCell.textContent = '❌ Not on S3';
+      cell.innerHTML = '<span class="pending">n/a</span>';
+      const div = document.createElement('div');
+      div.className = 'candidates';
+      div.innerHTML = '<div class="head">similar in S3:</div>' + info.candidates.map(c =>
+        `<a data-src="${escape(src)}" data-pick="${escape(c.s3_source)}" data-bytes="${c.bytes}">${escape(c.name)} — ${humanBytes(c.bytes)}</a>`
+      ).join('');
+      cell.appendChild(div);
+    } else {
+      row.classList.remove('missing');
+      row.classList.add('notfound');
+      statusCell.textContent = '❌ Not on S3';
+      cell.innerHTML = '<span class="pending">n/a</span>';
+      // can't sync — disable checkbox
+      const cb = row.querySelector('input.pick');
+      if (cb) { cb.checked = false; cb.disabled = true; }
+    }
+  }
+  recomputeTotal();
+
+  document.querySelectorAll('.candidates a').forEach(a => {
+    a.addEventListener('click', () => {
+      const orig = a.dataset.src;
+      const pick = a.dataset.pick;
+      const bytes = Number(a.dataset.bytes);
+      overrides[orig] = pick;
+      sizeCache[orig] = { bytes, files: 1, candidates: [] };
+      const row = document.querySelector(`tr[data-src="${cssEscape(orig)}"]`);
+      row.classList.remove('notfound');
+      row.classList.add('missing');
+      row.querySelector('.status').textContent = '🔴 Missing (substituted)';
+      const cell = row.querySelector('.size');
+      cell.innerHTML = humanBytes(bytes) + ` <small style="color:#666">→ ${escape(pick.split('/').pop())}</small>`;
+      const cb = row.querySelector('input.pick');
+      if (cb) { cb.disabled = false; cb.checked = true; }
+      recomputeTotal();
+    });
+  });
+}
+
+function recomputeTotal() {
+  let total = 0, count = 0;
+  document.querySelectorAll('input.pick').forEach(cb => {
+    if (!cb.checked) return;
+    const row = cb.closest('tr');
+    const src = row.dataset.src;
+    const sz = sizeCache[src];
+    if (sz && sz.bytes) { total += sz.bytes; count++; }
+  });
+  totalEl.textContent = count
+    ? `Selected: ${count} item${count===1?'':'s'} · ${humanBytes(total)}`
+    : 'Nothing selected.';
+}
+
+function cssEscape(s) { return s.replace(/"/g, '\\"'); }
+
+function escape(s) {
+  return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+
+function isPicked(s3_source) {
+  const row = document.querySelector(`tr[data-src="${cssEscape(s3_source)}"]`);
+  const cb = row && row.querySelector('input.pick');
+  return !!(cb && cb.checked);
+}
+
+function buildSyncItems() {
+  const items = [];
+  for (const m of lastAnalysis.models) {
+    if (m.exists_locally || !m.s3_source) continue;
+    if (!isPicked(m.s3_source)) continue;
+    const sz = sizeCache[m.s3_source];
+    if (!sz || sz.bytes == null) continue;  // not on S3, skip
+    const src = overrides[m.s3_source] || m.s3_source;
+    items.push({
+      s3_source: src, local_dest: m.local_path, is_file: true,
+      expected_bytes: sz.bytes,
+      _row_key: m.s3_source,
+    });
+  }
+  for (const n of lastAnalysis.custom_nodes) {
+    if (n.status !== 'missing' || !n.s3_source) continue;
+    if (!isPicked(n.s3_source)) continue;
+    const sz = sizeCache[n.s3_source];
+    if (!sz || sz.bytes == null) continue;
+    items.push({
+      s3_source: n.s3_source, local_dest: n.local_path, is_file: false,
+      expected_bytes: sz.bytes,
+      _row_key: n.s3_source,
+    });
+  }
+  return items;
+}
+
+function bindPicks() {
+  document.querySelectorAll('input.pick').forEach(cb => {
+    cb.addEventListener('change', recomputeTotal);
+  });
+}
+
+document.getElementById('select-all-btn').addEventListener('click', () => {
+  document.querySelectorAll('input.pick').forEach(cb => { cb.checked = true; });
+  recomputeTotal();
+});
+document.getElementById('clear-all-btn').addEventListener('click', () => {
+  document.querySelectorAll('input.pick').forEach(cb => { cb.checked = false; });
+  recomputeTotal();
+});
+
+function attachProgress(row, expected) {
+  let bar = row.querySelector('.progress');
+  if (!bar) {
+    bar = document.createElement('span');
+    bar.className = 'progress';
+    bar.innerHTML = '<div></div>';
+    row.querySelector('.size').appendChild(bar);
+  }
+  return { bar, fill: bar.querySelector('div'), expected };
+}
+
+syncBtn.addEventListener('click', async () => {
+  const items = buildSyncItems();
+  if (!items.length) { alert('nothing to sync'); return; }
+  syncBtn.disabled = true;
+  cons.style.display = '';
+  cons.textContent = '';
+  syncRows = items.map(it => {
+    const row = document.querySelector(`tr[data-src="${cssEscape(it._row_key)}"]`);
+    return row ? attachProgress(row, it.expected_bytes) : null;
+  });
+  // strip _row_key before sending
+  const payload = items.map(({_row_key, ...rest}) => rest);
+
+  const r = await fetch('/sync', {
+    method:'POST', headers:{'content-type':'application/json'},
+    body: JSON.stringify({ items: payload })
+  });
+  const { job_id } = await r.json();
+  const es = new EventSource(`/sync/${job_id}/stream`);
+  es.onmessage = ev => {
+    const msg = JSON.parse(ev.data);
+    if (msg.event === 'start') {
+      cons.textContent += `\n$ ${msg.cmd}\n`;
+    } else if (msg.event === 'log') {
+      cons.textContent += msg.line + '\n';
+    } else if (msg.event === 'progress') {
+      const r = syncRows[msg.item_index];
+      if (r && r.expected) {
+        const pct = Math.min(100, msg.bytes_downloaded / r.expected * 100);
+        r.fill.style.width = pct.toFixed(1) + '%';
+      }
+    } else if (msg.event === 'exit') {
+      const r = syncRows[msg.item_index];
+      if (r) r.fill.style.width = msg.exit_code === 0 ? '100%' : r.fill.style.width;
+      cons.textContent += `[exit ${msg.exit_code}]\n`;
+    } else if (msg.event === 'error') {
+      cons.textContent += `[error] ${msg.message}\n`;
+    } else if (msg.event === 'done') {
+      cons.textContent += `\n--- done (exit ${msg.exit_code}) ---\n`;
+      es.close();
+      if (msg.exit_code === 0 && lastWorkflows.length) {
+        cons.textContent += `re-analyzing…\n`;
+        analyzeAll(lastWorkflows);
+      } else {
+        reBtn.style.display = '';
+      }
+    }
+    cons.scrollTop = cons.scrollHeight;
+  };
+});
+
+reBtn.addEventListener('click', () => analyzeAll(lastWorkflows));
+</script>
+</body>
+</html>
