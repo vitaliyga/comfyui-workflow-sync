@@ -74,6 +74,78 @@ WantedBy=multi-user.target
 
 Logs: `journalctl -u comfyui-sync -f`.
 
+### RunPod
+
+RunPod pods don't run systemd, and the container is restarted on every
+pod start — so you set up an autostart hook that runs every boot.
+
+1. **One-time setup** (inside the pod terminal):
+
+   ```bash
+   cd /workspace
+   git clone <repo> comfyui-workflow-sync
+   cd comfyui-workflow-sync
+
+   # uv + python deps
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   export PATH="$HOME/.local/bin:$PATH"
+   uv sync
+
+   # aws CLI v2 if not present
+   apt-get update && apt-get install -y unzip
+   curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/aws.zip
+   unzip -q /tmp/aws.zip -d /tmp && /tmp/aws/install
+
+   # .env — put it on the persistent volume so it survives pod restarts
+   cp .env.example .env
+   nano .env
+   ```
+
+   In `.env` set `COMFYUI_PATH=/workspace/ComfyUI` (or whatever path your pod
+   template uses).
+
+2. **Expose the port.** In the pod's "Edit Pod" settings add TCP port `8765`
+   to **Expose HTTP Ports**. RunPod gives you a URL like
+   `https://<pod-id>-8765.proxy.runpod.net`.
+
+3. **Autostart on pod boot.** RunPod's official ComfyUI templates run a
+   `start.sh`-style script — append a launcher to it, or put a hook in
+   `/workspace/onstart.sh` and reference it from the pod's "Start Command".
+
+   ```bash
+   cat > /workspace/start-sync.sh <<'EOF'
+   #!/usr/bin/env bash
+   set -e
+   export PATH="$HOME/.local/bin:$PATH"
+   cd /workspace/comfyui-workflow-sync
+   exec uv run python main.py >> /workspace/comfyui-sync.log 2>&1
+   EOF
+   chmod +x /workspace/start-sync.sh
+   ```
+
+   Then in the RunPod template **Container Start Command**, run both
+   ComfyUI and this app:
+
+   ```bash
+   bash -lc 'cd /workspace/ComfyUI && python main.py --listen 0.0.0.0 & /workspace/start-sync.sh'
+   ```
+
+   Or if you don't want to edit the template, just run it in a detached
+   `tmux` session after pod start:
+
+   ```bash
+   tmux new-session -d -s sync '/workspace/start-sync.sh'
+   ```
+
+4. **Logs:** `tail -f /workspace/comfyui-sync.log`.
+
+Notes:
+- Keep the repo + `.env` under `/workspace` (the only persistent volume on RunPod).
+- The proxy URL is HTTPS and supports SSE — no extra config.
+- `aws CLI` install needs to be re-run if your container template doesn't
+  persist `/usr` between restarts. Easier: add the AWS-CLI install line to
+  your start script (idempotent — `aws --version` check first).
+
 ### macOS (launchd)
 
 Put this in `~/Library/LaunchAgents/com.local.comfyui-sync.plist`, then
