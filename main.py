@@ -171,6 +171,8 @@ def analyze(body: AnalyzeBody):
 
 
 PREFLIGHT_CACHE: dict[str, Any] | None = None
+PREFLIGHT_TS: float = 0.0
+PREFLIGHT_TTL = 120.0
 
 
 async def _probe(args: list[str]) -> dict[str, Any]:
@@ -190,8 +192,8 @@ async def _probe(args: list[str]) -> dict[str, Any]:
 
 
 async def preflight() -> dict[str, Any]:
-    global PREFLIGHT_CACHE
-    if PREFLIGHT_CACHE is not None:
+    global PREFLIGHT_CACHE, PREFLIGHT_TS
+    if PREFLIGHT_CACHE is not None and (time.monotonic() - PREFLIGHT_TS) < PREFLIGHT_TTL:
         return PREFLIGHT_CACHE
     auth = await _probe(["aws", "sts", "get-caller-identity"])
     models_check = (
@@ -210,6 +212,7 @@ async def preflight() -> dict[str, Any]:
         "comfyui": {"ok": comfy_ok, "path": str(COMFY),
                     "error": None if comfy_ok else "ComfyUI path missing or has no models/ subdir"},
     }
+    PREFLIGHT_TS = time.monotonic()
     return PREFLIGHT_CACHE
 
 
@@ -532,6 +535,7 @@ async def run_job(job_id: str, items: list[SyncItem]):
         job["exit_code"] = overall_rc
         job["done"] = True
         await q.put({"event": "done", "exit_code": overall_rc})
+        _schedule_job_cleanup(job_id)
 
 
 def _check_disk_space(items: list[SyncItem]) -> tuple[int, int]:
@@ -543,10 +547,31 @@ def _check_disk_space(items: list[SyncItem]) -> tuple[int, int]:
     return total, free
 
 
+def _validate_local_dest(dest: str) -> None:
+    """Reject paths that escape COMFY (prevents .. traversal)."""
+    try:
+        resolved = Path(dest).resolve()
+    except (OSError, RuntimeError) as e:
+        raise HTTPException(400, f"invalid local_dest: {e}")
+    root = COMFY.resolve()
+    if resolved != root and root not in resolved.parents:
+        raise HTTPException(400, f"local_dest outside ComfyUI path: {dest}")
+
+
+JOB_TTL_SECS = 300.0
+
+
+def _schedule_job_cleanup(job_id: str) -> None:
+    loop = asyncio.get_event_loop()
+    loop.call_later(JOB_TTL_SECS, JOBS.pop, job_id, None)
+
+
 @app.post("/sync")
 async def sync(body: SyncBody):
     if not body.items:
         raise HTTPException(400, "no items")
+    for it in body.items:
+        _validate_local_dest(it.local_dest)
     needed, free = _check_disk_space(body.items)
     if needed and free and needed > free * 0.95:
         raise HTTPException(

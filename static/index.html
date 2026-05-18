@@ -143,13 +143,13 @@ function refreshStatus() {
       issues.push({ kind:'error', text:`ComfyUI path issue: ${pf.comfyui.error}` });
     }
     if (pf.auth && !pf.auth.ok) {
-      issues.push({ kind:'error', text:`AWS auth failed: ${escape(pf.auth.error || '')}` });
+      issues.push({ kind:'error', text:`AWS auth failed: ${escHtml(pf.auth.error || '')}` });
     }
     if (pf.models_bucket && !pf.models_bucket.ok) {
-      issues.push({ kind:'warn', text:`S3 models bucket unreachable: ${escape(pf.models_bucket.error || '')}` });
+      issues.push({ kind:'warn', text:`S3 models bucket unreachable: ${escHtml(pf.models_bucket.error || '')}` });
     }
     if (pf.nodes_bucket && !pf.nodes_bucket.ok) {
-      issues.push({ kind:'warn', text:`S3 nodes bucket unreachable: ${escape(pf.nodes_bucket.error || '')}` });
+      issues.push({ kind:'warn', text:`S3 nodes bucket unreachable: ${escHtml(pf.nodes_bucket.error || '')}` });
     }
     setBanners(issues);
     return s;
@@ -187,7 +187,7 @@ function showFiles(names) {
   const el = document.getElementById('files');
   el.style.display = '';
   el.innerHTML = `<span class="label">Loaded (${names.length}):</span>` +
-    names.map(n => `<span class="chip">${escape(n)}</span>`).join('');
+    names.map(n => `<span class="chip">${escHtml(n)}</span>`).join('');
 }
 
 async function analyzeAll(workflows) {
@@ -242,11 +242,11 @@ function render() {
     const syncable = !m.exists_locally && !!m.s3_source;
     tr.innerHTML = `
       ${checkboxCell(syncable)}
-      <td>${escape(m.file)}</td>
-      <td>${escape(m.folder)}</td>
+      <td>${escHtml(m.file)}</td>
+      <td>${escHtml(m.folder)}</td>
       <td class="status">${status}</td>
       <td class="size">${m.exists_locally ? '—' : '<span class="pending">…</span>'}</td>
-      <td><code>${m.exists_locally ? '—' : escape(m.s3_source || '')}</code></td>`;
+      <td><code>${m.exists_locally ? '—' : escHtml(m.s3_source || '')}</code></td>`;
     modelsBody.appendChild(tr);
   }
   nodesBody.innerHTML = '';
@@ -260,11 +260,11 @@ function render() {
     const syncable = n.status === 'missing' && !!n.s3_source;
     const sizeCell = syncable ? '<span class="pending">…</span>' : '—';
     const note = n.status === 'unknown' ? '<code>not in config</code>' :
-                 (n.exists_locally ? '<code>—</code>' : `<code>${escape(n.s3_source || '')}</code>`);
+                 (n.exists_locally ? '<code>—</code>' : `<code>${escHtml(n.s3_source || '')}</code>`);
     tr.innerHTML = `
       ${checkboxCell(syncable)}
-      <td>${escape(n.node_type)}</td>
-      <td>${escape(n.package_hint || '—')}</td>
+      <td>${escHtml(n.node_type)}</td>
+      <td>${escHtml(n.package_hint || '—')}</td>
       <td class="status">${status}</td>
       <td class="size">${sizeCell}</td>
       <td>${note}</td>`;
@@ -313,7 +313,7 @@ async function fetchSizes() {
       const div = document.createElement('div');
       div.className = 'candidates';
       div.innerHTML = '<div class="head">similar in S3:</div>' + info.candidates.map(c =>
-        `<a data-src="${escape(src)}" data-pick="${escape(c.s3_source)}" data-bytes="${c.bytes}">${escape(c.name)} — ${humanBytes(c.bytes)}</a>`
+        `<a data-src="${escHtml(src)}" data-pick="${escHtml(c.s3_source)}" data-bytes="${c.bytes}">${escHtml(c.name)} — ${humanBytes(c.bytes)}</a>`
       ).join('');
       cell.appendChild(div);
     } else {
@@ -340,7 +340,7 @@ async function fetchSizes() {
       row.classList.add('missing');
       row.querySelector('.status').textContent = '🔴 Missing (substituted)';
       const cell = row.querySelector('.size');
-      cell.innerHTML = humanBytes(bytes) + ` <small style="color:#666">→ ${escape(pick.split('/').pop())}</small>`;
+      cell.innerHTML = humanBytes(bytes) + ` <small style="color:#666">→ ${escHtml(pick.split('/').pop())}</small>`;
       const cb = row.querySelector('input.pick');
       if (cb) { cb.disabled = false; cb.checked = true; }
       recomputeTotal();
@@ -362,9 +362,9 @@ function recomputeTotal() {
     : 'Nothing selected.';
 }
 
-function cssEscape(s) { return s.replace(/"/g, '\\"'); }
+function cssEscape(s) { return CSS.escape(s); }
 
-function escape(s) {
+function escHtml(s) {
   return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 }
 
