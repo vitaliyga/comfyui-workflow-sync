@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
+import shutil
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -167,8 +170,54 @@ def analyze(body: AnalyzeBody):
     }
 
 
+PREFLIGHT_CACHE: dict[str, Any] | None = None
+
+
+async def _probe(args: list[str]) -> dict[str, Any]:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, err = await proc.communicate()
+        return {
+            "ok": proc.returncode == 0,
+            "error": None if proc.returncode == 0 else err.decode("utf-8", "replace").strip()[:300],
+        }
+    except FileNotFoundError:
+        return {"ok": False, "error": "aws CLI not found in PATH"}
+
+
+async def preflight() -> dict[str, Any]:
+    global PREFLIGHT_CACHE
+    if PREFLIGHT_CACHE is not None:
+        return PREFLIGHT_CACHE
+    auth = await _probe(["aws", "sts", "get-caller-identity"])
+    models_check = (
+        await _probe(["aws", "s3", "ls", S3_MODELS_BASE + "/"])
+        if S3_MODELS_BASE else {"ok": False, "error": "S3_MODELS_BASE not set"}
+    )
+    nodes_check = (
+        await _probe(["aws", "s3", "ls", S3_NODES_BASE + "/"])
+        if S3_NODES_BASE else None
+    )
+    comfy_ok = COMFY.exists() and (COMFY / "models").exists()
+    PREFLIGHT_CACHE = {
+        "auth": auth,
+        "models_bucket": models_check,
+        "nodes_bucket": nodes_check,
+        "comfyui": {"ok": comfy_ok, "path": str(COMFY),
+                    "error": None if comfy_ok else "ComfyUI path missing or has no models/ subdir"},
+    }
+    return PREFLIGHT_CACHE
+
+
 @app.get("/status")
-def status():
+async def status(refresh: bool = False):
+    global PREFLIGHT_CACHE
+    if refresh:
+        PREFLIGHT_CACHE = None
     models: dict[str, list[str]] = {}
     if MODELS_DIR.exists():
         for folder in MODEL_FOLDERS:
@@ -184,7 +233,18 @@ def status():
     nodes: list[str] = []
     if NODES_DIR.exists():
         nodes = sorted(d.name for d in NODES_DIR.iterdir() if d.is_dir())
-    return {"comfyui_path": str(COMFY), "models": models, "custom_nodes": nodes}
+    try:
+        free = shutil.disk_usage(COMFY if COMFY.exists() else COMFY.parent).free
+    except OSError:
+        free = None
+    return {
+        "comfyui_path": str(COMFY),
+        "models": models,
+        "custom_nodes": nodes,
+        "disk_free": free,
+        "preflight": await preflight(),
+        "parallel": PARALLEL_SEM_SIZE,
+    }
 
 
 class SyncItem(BaseModel):
@@ -294,11 +354,14 @@ def dir_bytes(path: Path) -> int:
     return total
 
 
-def build_command(item: SyncItem) -> list[str]:
-    is_file_src = item.is_file or any(
+def is_file_source(item: SyncItem) -> bool:
+    return item.is_file or any(
         item.s3_source.lower().endswith(ext) for ext in MODEL_EXTS
     )
-    if is_file_src:
+
+
+def build_command(item: SyncItem) -> list[str]:
+    if is_file_source(item):
         src = item.s3_source
         parent, _, filename = src.rpartition("/")
         parent += "/"
@@ -314,111 +377,210 @@ def build_command(item: SyncItem) -> list[str]:
     return ["aws", "s3", "sync", src, dst, "--exact-timestamps"]
 
 
-async def run_job(job_id: str, items: list[SyncItem]):
-    job = JOBS[job_id]
-    q: asyncio.Queue = job["queue"]
-    overall_rc = 0
-    try:
-        for idx, item in enumerate(items):
-            cmd = build_command(item)
-            await q.put({
-                "event": "start",
-                "item_index": idx,
-                "s3_source": item.s3_source,
-                "local_dest": item.local_dest,
-                "expected_bytes": item.expected_bytes,
-                "cmd": " ".join(cmd),
-            })
-            local_target = Path(item.local_dest)
-            is_file_dest = bool(local_target.suffix)
-            mkdir_target = local_target.parent if is_file_dest else local_target
-            mkdir_target.mkdir(parents=True, exist_ok=True)
-            # Poll the directory where aws is writing — for single files that's
-            # the parent (aws uses a tempfile next to the target then renames).
-            poll_target = local_target.parent if is_file_dest else local_target
-            start_bytes = dir_bytes(poll_target)
+_UNIT_FACTORS = {
+    "B": 1, "KiB": 1024, "MiB": 1024**2, "GiB": 1024**3, "TiB": 1024**4,
+    "KB": 1000, "MB": 1000**2, "GB": 1000**3, "TB": 1000**4,
+}
+_PROGRESS_RE = re.compile(r"Completed\s+([\d.]+)\s+(\w+)/([\d.]+)\s+(\w+)")
 
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
 
-            async def poll_progress():
-                while True:
-                    await asyncio.sleep(1.5)
-                    cur = dir_bytes(poll_target)
-                    await q.put({
-                        "event": "progress",
-                        "item_index": idx,
-                        "bytes_downloaded": max(0, cur - start_bytes),
-                        "bytes_local": cur,
-                    })
+def _to_bytes(value: float, unit: str) -> int:
+    return int(value * _UNIT_FACTORS.get(unit, 1))
 
-            poller = asyncio.create_task(poll_progress())
+
+PARALLEL_LIMIT = int(os.environ.get("SYNC_PARALLEL", "3"))
+STALL_THRESHOLD = float(os.environ.get("SYNC_STALL_SECS", "8"))
+PARALLEL_SEM_SIZE = max(1, PARALLEL_LIMIT)
+
+
+async def process_item(idx: int, item: SyncItem, q: asyncio.Queue,
+                       sem: asyncio.Semaphore, job: dict[str, Any]) -> int:
+    async with sem:
+        if job["cancelled"]:
+            await q.put({"event": "exit", "item_index": idx, "exit_code": 130})
+            return 130
+
+        cmd = build_command(item)
+        await q.put({
+            "event": "start",
+            "item_index": idx,
+            "s3_source": item.s3_source,
+            "local_dest": item.local_dest,
+            "expected_bytes": item.expected_bytes,
+            "cmd": " ".join(cmd),
+        })
+
+        local_target = Path(item.local_dest)
+        is_file_dest = bool(local_target.suffix)
+        mkdir_target = local_target.parent if is_file_dest else local_target
+        mkdir_target.mkdir(parents=True, exist_ok=True)
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        job["procs"].append(proc)
+
+        state = {"bytes": 0, "ts": time.monotonic(), "stalled": False}
+
+        async def watchdog():
+            while True:
+                await asyncio.sleep(2)
+                idle = time.monotonic() - state["ts"]
+                if idle > STALL_THRESHOLD and not state["stalled"]:
+                    state["stalled"] = True
+                    await q.put({"event": "stalled", "item_index": idx, "stalled": True})
+                elif idle <= STALL_THRESHOLD and state["stalled"]:
+                    state["stalled"] = False
+                    await q.put({"event": "stalled", "item_index": idx, "stalled": False})
+
+        wd = asyncio.create_task(watchdog())
+
+        try:
             assert proc.stdout is not None
+            buf = b""
+            while True:
+                chunk = await proc.stdout.read(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                parts = re.split(rb"[\r\n]", buf)
+                buf = parts[-1]
+                for raw in parts[:-1]:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line:
+                        continue
+                    m = _PROGRESS_RE.search(line)
+                    if m:
+                        cur = _to_bytes(float(m.group(1)), m.group(2))
+                        if cur > state["bytes"]:
+                            state["bytes"] = cur
+                            state["ts"] = time.monotonic()
+                            await q.put({
+                                "event": "progress",
+                                "item_index": idx,
+                                "bytes_downloaded": cur,
+                            })
+                    else:
+                        await q.put({
+                            "event": "log",
+                            "item_index": idx,
+                            "line": line,
+                        })
+            rc = await proc.wait()
+        finally:
+            wd.cancel()
             try:
-                async for line in proc.stdout:
-                    await q.put({
-                        "event": "log",
-                        "item_index": idx,
-                        "line": line.decode("utf-8", "replace").rstrip(),
-                    })
-                rc = await proc.wait()
-            finally:
-                poller.cancel()
-                try:
-                    await poller
-                except asyncio.CancelledError:
-                    pass
+                await wd
+            except asyncio.CancelledError:
+                pass
 
-            final_cur = dir_bytes(poll_target)
+        # final bump to 100% on success
+        if rc == 0 and item.expected_bytes:
             await q.put({
                 "event": "progress",
                 "item_index": idx,
-                "bytes_downloaded": max(0, final_cur - start_bytes),
-                "bytes_local": final_cur,
+                "bytes_downloaded": item.expected_bytes,
             })
-            await q.put({"event": "exit", "item_index": idx, "exit_code": rc})
-            if rc != 0:
-                overall_rc = rc
-                continue
-            # post-sync hook: pip install -r requirements.txt for custom nodes
-            if not (item.is_file or any(
-                item.s3_source.lower().endswith(ext) for ext in MODEL_EXTS
-            )):
-                req = Path(item.local_dest) / "requirements.txt"
-                if req.exists():
-                    await q.put({"event": "log", "line": f"installing {req}"})
-                    pip = await asyncio.create_subprocess_exec(
-                        "pip", "install", "-r", str(req),
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.STDOUT,
-                    )
-                    assert pip.stdout is not None
-                    async for line in pip.stdout:
-                        await q.put({
-                            "event": "log",
-                            "line": line.decode("utf-8", "replace").rstrip(),
-                        })
-                    await pip.wait()
-    except Exception as e:
-        await q.put({"event": "error", "message": str(e)})
-        overall_rc = 1
+
+        await q.put({"event": "exit", "item_index": idx, "exit_code": rc})
+
+        # post-sync: pip install for custom node dirs
+        if rc == 0 and not is_file_source(item):
+            req = Path(item.local_dest) / "requirements.txt"
+            if req.exists() and not job["cancelled"]:
+                await q.put({
+                    "event": "log", "item_index": idx,
+                    "line": f"installing {req}"
+                })
+                pip = await asyncio.create_subprocess_exec(
+                    "pip", "install", "-r", str(req),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                job["procs"].append(pip)
+                assert pip.stdout is not None
+                async for line in pip.stdout:
+                    await q.put({
+                        "event": "log", "item_index": idx,
+                        "line": line.decode("utf-8", "replace").rstrip(),
+                    })
+                await pip.wait()
+        return rc
+
+
+async def run_job(job_id: str, items: list[SyncItem]):
+    job = JOBS[job_id]
+    q: asyncio.Queue = job["queue"]
+    sem = asyncio.Semaphore(PARALLEL_SEM_SIZE)
+    overall_rc = 0
+    try:
+        results = await asyncio.gather(
+            *(process_item(i, it, q, sem, job) for i, it in enumerate(items)),
+            return_exceptions=True,
+        )
+        for r in results:
+            if isinstance(r, Exception):
+                await q.put({"event": "error", "message": str(r)})
+                overall_rc = 1
+            elif isinstance(r, int) and r != 0:
+                overall_rc = r
     finally:
+        if job["cancelled"]:
+            overall_rc = 130
         job["exit_code"] = overall_rc
         job["done"] = True
         await q.put({"event": "done", "exit_code": overall_rc})
+
+
+def _check_disk_space(items: list[SyncItem]) -> tuple[int, int]:
+    total = sum((it.expected_bytes or 0) for it in items)
+    try:
+        free = shutil.disk_usage(COMFY if COMFY.exists() else COMFY.parent).free
+    except OSError:
+        free = 0
+    return total, free
 
 
 @app.post("/sync")
 async def sync(body: SyncBody):
     if not body.items:
         raise HTTPException(400, "no items")
+    needed, free = _check_disk_space(body.items)
+    if needed and free and needed > free * 0.95:
+        raise HTTPException(
+            400,
+            f"not enough disk space: need {needed} bytes, free {free} bytes",
+        )
     job_id = str(uuid.uuid4())
-    JOBS[job_id] = {"queue": asyncio.Queue(), "done": False, "exit_code": None}
+    JOBS[job_id] = {
+        "queue": asyncio.Queue(),
+        "done": False,
+        "exit_code": None,
+        "cancelled": False,
+        "procs": [],
+    }
     asyncio.create_task(run_job(job_id, body.items))
-    return {"job_id": job_id}
+    return {"job_id": job_id, "parallel": PARALLEL_SEM_SIZE}
+
+
+@app.delete("/sync/{job_id}")
+async def cancel_sync(job_id: str):
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "unknown job")
+    job["cancelled"] = True
+    killed = 0
+    for proc in job["procs"]:
+        if proc.returncode is None:
+            try:
+                proc.terminate()
+                killed += 1
+            except ProcessLookupError:
+                pass
+    await job["queue"].put({"event": "log", "line": f"[cancelled — {killed} proc(s) terminated]"})
+    return {"cancelled": True, "terminated": killed}
 
 
 @app.get("/sync/{job_id}/stream")

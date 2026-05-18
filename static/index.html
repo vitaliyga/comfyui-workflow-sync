@@ -57,11 +57,22 @@
     max-height:400px; overflow:auto; white-space:pre-wrap; display:none;
   }
   .meta { color:#777; font-size:12px; margin-bottom:16px; }
+  #banners { margin-bottom:12px; }
+  .banner {
+    padding:8px 12px; border-radius:4px; margin-bottom:6px;
+    font-size:12px; border:1px solid;
+  }
+  .banner.error { background:#3a1a1a; border-color:#622; color:#f88; }
+  .banner.warn  { background:#3a2a1a; border-color:#763; color:#fc6; }
+  .banner.ok    { background:#1a2a1a; border-color:#363; color:#9c6; }
+  button.danger { background:#a33; }
+  .stalled { color:#fc6; font-size:11px; margin-left:6px; }
 </style>
 </head>
 <body>
 <h1>ComfyUI S3 Sync</h1>
 <div class="meta" id="meta">…</div>
+<div id="banners"></div>
 <div id="drop">
   Drop workflow .json files here, or click to choose
   <small>multiple files supported — deps will be merged</small>
@@ -87,6 +98,7 @@
   <button id="select-all-btn" class="secondary">Select All</button>
   <button id="clear-all-btn" class="secondary">Clear All</button>
   <button id="sync-btn">Sync Selected</button>
+  <button id="stop-btn" class="danger" style="display:none">Stop</button>
   <button id="reanalyze-btn" class="secondary" style="display:none">Re-analyze</button>
 </div>
 
@@ -112,9 +124,38 @@ const syncBtn = document.getElementById('sync-btn');
 const reBtn = document.getElementById('reanalyze-btn');
 const cons = document.getElementById('console');
 
-fetch('/status').then(r=>r.json()).then(s=>{
-  meta.textContent = `ComfyUI: ${s.comfyui_path} · ${s.custom_nodes.length} custom nodes installed · downloader: aws s3 sync`;
-});
+let currentJobId = null;
+const stopBtn = document.getElementById('stop-btn');
+const banners = document.getElementById('banners');
+
+function setBanners(items) {
+  banners.innerHTML = items.map(b =>
+    `<div class="banner ${b.kind}">${b.text}</div>`).join('');
+}
+
+function refreshStatus() {
+  return fetch('/status').then(r=>r.json()).then(s=>{
+    const free = s.disk_free != null ? humanBytes(s.disk_free) : 'n/a';
+    meta.textContent = `ComfyUI: ${s.comfyui_path} · ${s.custom_nodes.length} custom nodes · free disk: ${free} · parallel: ${s.parallel} · aws s3 sync`;
+    const issues = [];
+    const pf = s.preflight || {};
+    if (pf.comfyui && !pf.comfyui.ok) {
+      issues.push({ kind:'error', text:`ComfyUI path issue: ${pf.comfyui.error}` });
+    }
+    if (pf.auth && !pf.auth.ok) {
+      issues.push({ kind:'error', text:`AWS auth failed: ${escape(pf.auth.error || '')}` });
+    }
+    if (pf.models_bucket && !pf.models_bucket.ok) {
+      issues.push({ kind:'warn', text:`S3 models bucket unreachable: ${escape(pf.models_bucket.error || '')}` });
+    }
+    if (pf.nodes_bucket && !pf.nodes_bucket.ok) {
+      issues.push({ kind:'warn', text:`S3 nodes bucket unreachable: ${escape(pf.nodes_bucket.error || '')}` });
+    }
+    setBanners(issues);
+    return s;
+  });
+}
+refreshStatus();
 
 const fileInput = document.getElementById('file-input');
 
@@ -387,10 +428,19 @@ function attachProgress(row, expected) {
   return { bar, fill: bar.querySelector('div'), expected };
 }
 
+stopBtn.addEventListener('click', async () => {
+  if (!currentJobId) return;
+  stopBtn.disabled = true;
+  await fetch(`/sync/${currentJobId}`, { method:'DELETE' });
+});
+
 syncBtn.addEventListener('click', async () => {
   const items = buildSyncItems();
   if (!items.length) { alert('nothing to sync'); return; }
   syncBtn.disabled = true;
+  stopBtn.disabled = false;
+  stopBtn.style.display = '';
+  reBtn.style.display = 'none';
   cons.style.display = '';
   cons.textContent = '';
   syncRows = items.map(it => {
@@ -404,7 +454,15 @@ syncBtn.addEventListener('click', async () => {
     method:'POST', headers:{'content-type':'application/json'},
     body: JSON.stringify({ items: payload })
   });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({ detail: r.statusText }));
+    alert(`sync failed: ${err.detail || r.statusText}`);
+    syncBtn.disabled = false;
+    stopBtn.style.display = 'none';
+    return;
+  }
   const { job_id } = await r.json();
+  currentJobId = job_id;
   const es = new EventSource(`/sync/${job_id}/stream`);
   es.onmessage = ev => {
     const msg = JSON.parse(ev.data);
@@ -418,6 +476,19 @@ syncBtn.addEventListener('click', async () => {
         const pct = Math.min(100, msg.bytes_downloaded / r.expected * 100);
         r.fill.style.width = pct.toFixed(1) + '%';
       }
+    } else if (msg.event === 'stalled') {
+      const r = syncRows[msg.item_index];
+      if (r) {
+        let tag = r.bar.parentElement.querySelector('.stalled');
+        if (msg.stalled) {
+          if (!tag) {
+            tag = document.createElement('span');
+            tag.className = 'stalled';
+            tag.textContent = '⚠ stalled';
+            r.bar.parentElement.appendChild(tag);
+          }
+        } else if (tag) tag.remove();
+      }
     } else if (msg.event === 'exit') {
       const r = syncRows[msg.item_index];
       if (r) r.fill.style.width = msg.exit_code === 0 ? '100%' : r.fill.style.width;
@@ -427,6 +498,8 @@ syncBtn.addEventListener('click', async () => {
     } else if (msg.event === 'done') {
       cons.textContent += `\n--- done (exit ${msg.exit_code}) ---\n`;
       es.close();
+      currentJobId = null;
+      stopBtn.style.display = 'none';
       if (msg.exit_code === 0 && lastWorkflows.length) {
         cons.textContent += `re-analyzing…\n`;
         analyzeAll(lastWorkflows);
