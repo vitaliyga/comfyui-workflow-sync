@@ -146,35 +146,6 @@ Notes:
   persist `/usr` between restarts. Easier: add the AWS-CLI install line to
   your start script (idempotent — `aws --version` check first).
 
-### macOS (launchd)
-
-Put this in `~/Library/LaunchAgents/com.local.comfyui-sync.plist`, then
-`launchctl load -w ~/Library/LaunchAgents/com.local.comfyui-sync.plist`.
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.local.comfyui-sync</string>
-  <key>WorkingDirectory</key><string>/Users/mac/Scripts/comfyui-workflow-sync</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/opt/homebrew/bin/uv</string>
-    <string>run</string>
-    <string>python</string>
-    <string>main.py</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/tmp/comfyui-sync.log</string>
-  <key>StandardErrorPath</key><string>/tmp/comfyui-sync.log</string>
-</dict>
-</plist>
-```
-
-Logs: `tail -f /tmp/comfyui-sync.log`. Stop: `launchctl unload ~/Library/LaunchAgents/com.local.comfyui-sync.plist`.
-
 ### Reverse-proxy (optional)
 
 For remote access put `nginx` / `caddy` in front. Minimal Caddyfile:
