@@ -136,7 +136,17 @@ function setBanners(items) {
 function refreshStatus() {
   return fetch('/status').then(r=>r.json()).then(s=>{
     const free = s.disk_free != null ? humanBytes(s.disk_free) : 'n/a';
-    meta.textContent = `ComfyUI: ${s.comfyui_path} · ${s.custom_nodes.length} custom nodes · free disk: ${free} · parallel: ${s.parallel} · aws s3 sync`;
+    const idx = s.index || {};
+    const ts = idx.indexed_at ? new Date(idx.indexed_at * 1000).toLocaleString() : '—';
+    meta.innerHTML = `ComfyUI: ${escHtml(s.comfyui_path)} · free disk: ${free} · parallel: ${s.parallel} · `
+      + `<span title="indexed at ${ts}">S3 index: ${idx.model_files||0} models / ${idx.node_classes||0} classes in ${idx.node_packages||0} pkgs</span> · `
+      + `<a href="#" id="reindex-link" style="color:#9cf">⟳ reindex</a>`;
+    document.getElementById('reindex-link').addEventListener('click', async e => {
+      e.preventDefault();
+      meta.innerHTML += ' <span style="color:#fc6">indexing…</span>';
+      await fetch('/reindex', { method:'POST' });
+      refreshStatus();
+    });
     const issues = [];
     const pf = s.preflight || {};
     if (pf.comfyui && !pf.comfyui.ok) {

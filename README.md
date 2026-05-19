@@ -36,6 +36,7 @@ $EDITOR config.yaml  # tweak node_packages / builtin_nodes for your install
 | `S3_NODES_BASE`           | base prefix for `custom_nodes/` (leave empty to disable)   |
 | `SYNC_PARALLEL`           | optional, max concurrent `aws s3 sync` procs (default `3`) |
 | `SYNC_STALL_SECS`         | optional, stalled-warning threshold (default `8`)          |
+| `INDEX_TTL`               | optional, S3 index cache TTL in seconds (default `86400`)  |
 
 ## Run
 
@@ -160,10 +161,20 @@ SSE streams work over HTTP/1.1 — no special config needed.
 
 ## How it works
 
-- `POST /analyze` — parses workflow `nodes[]`, extracts model filenames from
-  loader widgets (config `model_node_map`) and detects custom-node packages
-  via substring match (`node_packages`). Whitelist of stock nodes lives in
-  `builtin_nodes`.
+- **S3 index** (auto-built, refreshed every 24h or via `POST /reindex`):
+  - Models: one `aws s3 ls --recursive` under `$S3_MODELS_BASE`, builds
+    `{filename: {folder, bytes, s3_url}}` keyed by both full path and basename.
+  - Custom nodes: lists package dirs under `$S3_NODES_BASE`, fetches each
+    package's `__init__.py` (and follows `from .X import NODE_CLASS_MAPPINGS`
+    reexports), parses `NODE_CLASS_MAPPINGS` keys to build a
+    `{class_name: package_dir}` map.
+  - Cached to `.s3-index.json`. The whole bucket → ~5s for a few hundred models
+    and a dozen packages.
+- `POST /analyze` — parses workflow JSON (both standard and API-format),
+  every string ending in `.safetensors`/`.gguf`/etc. is looked up in the
+  models index; every node class name is looked up in the nodes index.
+  `node_packages` in config is a fallback override for packages that don't
+  register classes in a way the parser can detect.
 - `POST /size` — for each S3 source: `aws s3 ls --summarize` for prefixes,
   exact-or-fuzzy lookup for files. Returns size + similar-named candidates
   when an exact match is missing (handles renamed lora versions).

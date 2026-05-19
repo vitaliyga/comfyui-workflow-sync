@@ -5,3 +5,4 @@ __pycache__/
 .python-version
 json/*
 .DS_Store
+.s3-index.json

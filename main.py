@@ -79,36 +79,284 @@ app = FastAPI()
 JOBS: dict[str, dict[str, Any]] = {}
 
 
+# ---------- S3 index (auto-discovered) ----------
+
+INDEX_PATH = ROOT / ".s3-index.json"
+INDEX_TTL = float(os.environ.get("INDEX_TTL", str(24 * 3600)))
+_NCM_BLOCK_RE = re.compile(
+    r"NODE_CLASS_MAPPINGS\s*(?::\s*[^=]+)?=\s*\{(.*?)\n\}",
+    re.DOTALL,
+)
+_NCM_KEY_RE = re.compile(r"""["']([^"']+)["']\s*:""")
+# from .module import NODE_CLASS_MAPPINGS  (or with *, or rename)
+_NCM_REEXPORT_RE = re.compile(
+    r"from\s+\.([\w.]+)\s+import\s+(?:[^#\n]*?)(NODE_CLASS_MAPPINGS|\*)",
+)
+
+S3_INDEX: dict[str, Any] = {
+    "models": {"files": {}, "by_basename": {}},
+    "nodes": {"classes": {}, "packages": []},
+    "indexed_at": 0,
+}
+
+
+def _load_index_from_disk() -> None:
+    global S3_INDEX
+    if INDEX_PATH.exists():
+        try:
+            S3_INDEX = json.loads(INDEX_PATH.read_text())
+        except Exception:
+            pass
+
+
+_load_index_from_disk()
+
+
+def _save_index() -> None:
+    try:
+        INDEX_PATH.write_text(json.dumps(S3_INDEX))
+    except OSError:
+        pass
+
+
+def _split_s3(uri: str) -> tuple[str, str]:
+    no_scheme = uri.removeprefix("s3://")
+    bucket, _, prefix = no_scheme.partition("/")
+    return bucket, prefix
+
+
+async def _aws_text(args: list[str]) -> tuple[int, str]:
+    proc = await asyncio.create_subprocess_exec(
+        *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    out, _ = await proc.communicate()
+    return proc.returncode or 0, out.decode("utf-8", "replace")
+
+
+async def index_models() -> dict[str, Any]:
+    if not S3_MODELS_BASE:
+        return {"files": {}, "by_basename": {}}
+    base = S3_MODELS_BASE.rstrip("/") + "/"
+    _bucket, prefix = _split_s3(base)
+    rc, out = await _aws_text(["aws", "s3", "ls", "--recursive", base])
+    if rc != 0:
+        return {"files": {}, "by_basename": {}}
+    files: dict[str, dict[str, Any]] = {}
+    by_basename: dict[str, list[str]] = {}
+    for line in out.splitlines():
+        parts = line.split(maxsplit=3)
+        if len(parts) != 4 or not parts[2].isdigit():
+            continue
+        size = int(parts[2])
+        key = parts[3]
+        if not key.startswith(prefix):
+            continue
+        rel = key[len(prefix):]
+        segments = rel.split("/")
+        if any(s.startswith(".") or s.startswith("__") for s in segments):
+            continue
+        if not any(rel.lower().endswith(ext) for ext in MODEL_EXTS):
+            continue
+        folder = segments[0]
+        files[rel] = {
+            "folder": folder,
+            "bytes": size,
+            "s3_url": base + rel,
+        }
+        bn = segments[-1]
+        by_basename.setdefault(bn, []).append(rel)
+    return {"files": files, "by_basename": by_basename}
+
+
+def _parse_ncm_keys(text: str) -> list[str]:
+    out: list[str] = []
+    for m in _NCM_BLOCK_RE.finditer(text):
+        out.extend(_NCM_KEY_RE.findall(m.group(1)))
+    return out
+
+
+async def _fetch_py(base: str, pkg: str, rel: str) -> str:
+    """Fetch a .py file via aws s3 cp - to stdout. Empty on miss."""
+    rc, text = await _aws_text(
+        ["aws", "s3", "cp", f"{base}/{pkg}/{rel}", "-"]
+    )
+    return text if rc == 0 else ""
+
+
+async def _fetch_pkg_class_names(pkg: str) -> list[str]:
+    if not S3_NODES_BASE:
+        return []
+    base = S3_NODES_BASE.rstrip("/")
+    seen_paths: set[str] = set()
+    queue: list[str] = ["__init__.py", "nodes.py"]
+    collected: list[str] = []
+    depth = 0
+    while queue and depth < 6:
+        depth += 1
+        next_queue: list[str] = []
+        # batch-fetch this layer in parallel
+        texts = await asyncio.gather(*(
+            _fetch_py(base, pkg, p) for p in queue if p not in seen_paths
+        ))
+        paths_this_round = [p for p in queue if p not in seen_paths]
+        for path, text in zip(paths_this_round, texts):
+            seen_paths.add(path)
+            if not text:
+                continue
+            keys = _parse_ncm_keys(text)
+            if keys:
+                collected.extend(keys)
+                continue  # inline mapping found here — don't chase reexports
+            # only follow imports when this file had no inline mapping
+            for mod, _what in _NCM_REEXPORT_RE.findall(text):
+                p = mod.replace(".", "/") + ".py"
+                if p not in seen_paths:
+                    next_queue.append(p)
+                p2 = mod.replace(".", "/") + "/__init__.py"
+                if p2 not in seen_paths:
+                    next_queue.append(p2)
+        if collected:
+            break  # got something from this package, stop crawling
+        queue = next_queue
+    # dedup
+    return list(dict.fromkeys(collected))
+
+
+async def index_nodes() -> dict[str, Any]:
+    if not S3_NODES_BASE:
+        return {"classes": {}, "packages": []}
+    base = S3_NODES_BASE.rstrip("/") + "/"
+    rc, out = await _aws_text(["aws", "s3", "ls", base])
+    if rc != 0:
+        return {"classes": {}, "packages": []}
+    packages: list[str] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith("PRE "):
+            continue
+        pkg = line[4:].rstrip("/")
+        if pkg.startswith(".") or pkg.startswith("__"):
+            continue
+        packages.append(pkg)
+
+    sem = asyncio.Semaphore(8)
+    classes: dict[str, str] = {}
+    failed: list[str] = []
+
+    async def go(pkg: str):
+        async with sem:
+            names = await _fetch_pkg_class_names(pkg)
+            if not names:
+                failed.append(pkg)
+                return
+            for n in names:
+                classes.setdefault(n, pkg)
+
+    await asyncio.gather(*(go(p) for p in packages))
+    return {
+        "classes": classes,
+        "packages": sorted(packages),
+        "unparsed_packages": sorted(failed),
+    }
+
+
+async def rebuild_index() -> dict[str, Any]:
+    global S3_INDEX
+    models, nodes = await asyncio.gather(index_models(), index_nodes())
+    S3_INDEX = {
+        "models": models,
+        "nodes": nodes,
+        "indexed_at": time.time(),
+    }
+    _save_index()
+    return S3_INDEX
+
+
+async def ensure_index_fresh() -> None:
+    age = time.time() - S3_INDEX.get("indexed_at", 0)
+    if age > INDEX_TTL or not S3_INDEX.get("models", {}).get("files"):
+        await rebuild_index()
+
+
+def _lookup_model(filename: str, hint_folder: str | None = None) -> dict | None:
+    files = S3_INDEX.get("models", {}).get("files", {})
+    by_bn = S3_INDEX.get("models", {}).get("by_basename", {})
+    fn = filename.replace("\\", "/")
+    if fn in files:
+        return {"rel": fn, **files[fn]}
+    bn = fn.split("/")[-1]
+    matches = by_bn.get(bn, [])
+    if len(matches) == 1:
+        return {"rel": matches[0], **files[matches[0]]}
+    if matches and hint_folder:
+        pref = [m for m in matches if files[m]["folder"] == hint_folder]
+        if len(pref) == 1:
+            return {"rel": pref[0], **files[pref[0]]}
+    return None
+
+
+def _lookup_package(class_name: str) -> str | None:
+    pkg = S3_INDEX.get("nodes", {}).get("classes", {}).get(class_name)
+    if pkg:
+        return pkg
+    # legacy override fallback
+    return match_package(class_name)
+
+
+# ---------- workflow extractors (now index-driven) ----------
+
+
+def _build_model_entry(value: str, hint_folder: str | None) -> dict | None:
+    """Resolve a workflow model reference via S3 index; return row dict or None."""
+    if not isinstance(value, str) or not value.lower().endswith(MODEL_EXTS):
+        return None
+    info = _lookup_model(value, hint_folder)
+    if info:
+        folder = info["folder"]
+        rel = info["rel"]  # includes folder as first segment
+        local_path = MODELS_DIR / rel
+        # filename shown in UI: path within the folder, without folder prefix
+        rel_within = rel[len(folder) + 1:] if rel.startswith(folder + "/") else rel
+        return {
+            "file": rel_within,
+            "folder": folder,
+            "local_path": str(local_path),
+            "exists_locally": local_path.exists(),
+            "s3_source": info["s3_url"],
+            "s3_bytes": info["bytes"],
+            "s3_exists": True,
+        }
+    # not in index — best-effort placeholder
+    bn = value.replace("\\", "/").split("/")[-1]
+    folder = hint_folder or "?"
+    local_path = MODELS_DIR / folder / bn if hint_folder else None
+    return {
+        "file": value,
+        "folder": folder,
+        "local_path": str(local_path) if local_path else None,
+        "exists_locally": local_path.exists() if local_path else False,
+        "s3_source": None,
+        "s3_bytes": None,
+        "s3_exists": False,
+    }
+
+
 def extract_models(workflow: dict) -> list[dict]:
     out: list[dict] = []
     seen: set[tuple[str, str]] = set()
     for node in workflow.get("nodes", []):
         nt = node.get("type")
-        if nt not in MODEL_NODE_MAP:
-            continue
-        idx, folder = MODEL_NODE_MAP[nt]
+        hint = MODEL_NODE_MAP.get(nt, (None, None))[1] if nt in MODEL_NODE_MAP else None
         wv = node.get("widgets_values") or []
-        if idx >= len(wv):
-            continue
-        val = wv[idx]
-        if not isinstance(val, str):
-            continue
-        if not val.lower().endswith(MODEL_EXTS):
-            continue
-        rel = val.replace("\\", "/")
-        key = (folder, rel)
-        if key in seen:
-            continue
-        seen.add(key)
-        local_path = MODELS_DIR / folder / rel
-        out.append({
-            "file": rel,
-            "folder": folder,
-            "local_path": str(local_path),
-            "exists_locally": local_path.exists(),
-            "s3_source": model_s3_url(folder, rel),
-            "s3_exists": None,
-        })
+        for v in wv:
+            row = _build_model_entry(v, hint)
+            if not row:
+                continue
+            key = (row["folder"], row["file"])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(row)
     return out
 
 
@@ -137,29 +385,16 @@ def extract_models_api(workflow: dict) -> list[dict]:
     out: list[dict] = []
     seen: set[tuple[str, str]] = set()
     for _id, ct, inputs in _iter_api_nodes(workflow):
-        if ct not in MODEL_NODE_MAP:
-            continue
-        _idx, folder = MODEL_NODE_MAP[ct]
-        # API uses named inputs; just scan every string value for model extensions
+        hint = MODEL_NODE_MAP.get(ct, (None, None))[1] if ct in MODEL_NODE_MAP else None
         for v in inputs.values():
-            if not isinstance(v, str):
+            row = _build_model_entry(v, hint)
+            if not row:
                 continue
-            if not v.lower().endswith(MODEL_EXTS):
-                continue
-            rel = v.replace("\\", "/")
-            key = (folder, rel)
+            key = (row["folder"], row["file"])
             if key in seen:
                 continue
             seen.add(key)
-            local_path = MODELS_DIR / folder / rel
-            out.append({
-                "file": rel,
-                "folder": folder,
-                "local_path": str(local_path),
-                "exists_locally": local_path.exists(),
-                "s3_source": model_s3_url(folder, rel),
-                "s3_exists": None,
-            })
+            out.append(row)
     return out
 
 
@@ -170,6 +405,36 @@ def match_package(node_type: str) -> str | None:
     return None
 
 
+def _build_node_row(class_name: str, seen_pkg: set, seen_unknown: set) -> dict | None:
+    pkg = _lookup_package(class_name)
+    if pkg is None:
+        if class_name in seen_unknown:
+            return None
+        seen_unknown.add(class_name)
+        return {
+            "node_type": class_name,
+            "package_hint": None,
+            "local_path": None,
+            "exists_locally": None,
+            "s3_source": None,
+            "s3_exists": None,
+            "status": "unknown",
+        }
+    if pkg in seen_pkg:
+        return None
+    seen_pkg.add(pkg)
+    local_path = NODES_DIR / pkg
+    return {
+        "node_type": class_name,
+        "package_hint": pkg,
+        "local_path": str(local_path),
+        "exists_locally": local_path.exists(),
+        "s3_source": node_s3_url(pkg),
+        "s3_exists": None,
+        "status": "ok" if local_path.exists() else "missing",
+    }
+
+
 def extract_custom_nodes(workflow: dict) -> list[dict]:
     out: list[dict] = []
     seen_pkg: set[str] = set()
@@ -178,34 +443,9 @@ def extract_custom_nodes(workflow: dict) -> list[dict]:
         nt = node.get("type")
         if not nt or nt in BUILTIN:
             continue
-        pkg = match_package(nt)
-        if pkg is None:
-            if nt in seen_unknown:
-                continue
-            seen_unknown.add(nt)
-            out.append({
-                "node_type": nt,
-                "package_hint": None,
-                "local_path": None,
-                "exists_locally": None,
-                "s3_source": None,
-                "s3_exists": None,
-                "status": "unknown",
-            })
-            continue
-        if pkg in seen_pkg:
-            continue
-        seen_pkg.add(pkg)
-        local_path = NODES_DIR / pkg
-        out.append({
-            "node_type": nt,
-            "package_hint": pkg,
-            "local_path": str(local_path),
-            "exists_locally": local_path.exists(),
-            "s3_source": node_s3_url(pkg),
-            "s3_exists": None,
-            "status": "ok" if local_path.exists() else "missing",
-        })
+        row = _build_node_row(nt, seen_pkg, seen_unknown)
+        if row:
+            out.append(row)
     return out
 
 
@@ -216,34 +456,9 @@ def extract_custom_nodes_api(workflow: dict) -> list[dict]:
     for _id, ct, _inputs in _iter_api_nodes(workflow):
         if ct in BUILTIN:
             continue
-        pkg = match_package(ct)
-        if pkg is None:
-            if ct in seen_unknown:
-                continue
-            seen_unknown.add(ct)
-            out.append({
-                "node_type": ct,
-                "package_hint": None,
-                "local_path": None,
-                "exists_locally": None,
-                "s3_source": None,
-                "s3_exists": None,
-                "status": "unknown",
-            })
-            continue
-        if pkg in seen_pkg:
-            continue
-        seen_pkg.add(pkg)
-        local_path = NODES_DIR / pkg
-        out.append({
-            "node_type": ct,
-            "package_hint": pkg,
-            "local_path": str(local_path),
-            "exists_locally": local_path.exists(),
-            "s3_source": node_s3_url(pkg),
-            "s3_exists": None,
-            "status": "ok" if local_path.exists() else "missing",
-        })
+        row = _build_node_row(ct, seen_pkg, seen_unknown)
+        if row:
+            out.append(row)
     return out
 
 
@@ -252,7 +467,8 @@ class AnalyzeBody(BaseModel):
 
 
 @app.post("/analyze")
-def analyze(body: AnalyzeBody):
+async def analyze(body: AnalyzeBody):
+    await ensure_index_fresh()
     if _is_api_format(body.workflow):
         return {
             "format": "api",
@@ -336,6 +552,7 @@ async def status(refresh: bool = False):
         free = shutil.disk_usage(COMFY if COMFY.exists() else COMFY.parent).free
     except OSError:
         free = None
+    idx = S3_INDEX
     return {
         "comfyui_path": str(COMFY),
         "models": models,
@@ -343,6 +560,26 @@ async def status(refresh: bool = False):
         "disk_free": free,
         "preflight": await preflight(),
         "parallel": PARALLEL_SEM_SIZE,
+        "index": {
+            "indexed_at": idx.get("indexed_at", 0),
+            "model_files": len(idx.get("models", {}).get("files", {})),
+            "node_packages": len(idx.get("nodes", {}).get("packages", [])),
+            "node_classes": len(idx.get("nodes", {}).get("classes", {})),
+            "unparsed_packages": idx.get("nodes", {}).get("unparsed_packages", []),
+        },
+    }
+
+
+@app.post("/reindex")
+async def reindex():
+    t0 = time.monotonic()
+    await rebuild_index()
+    return {
+        "took": round(time.monotonic() - t0, 2),
+        "model_files": len(S3_INDEX["models"]["files"]),
+        "node_packages": len(S3_INDEX["nodes"]["packages"]),
+        "node_classes": len(S3_INDEX["nodes"]["classes"]),
+        "unparsed_packages": S3_INDEX["nodes"].get("unparsed_packages", []),
     }
 
 
