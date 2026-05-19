@@ -160,7 +160,7 @@ async def fetch_cm_registry() -> dict[str, Any]:
         return {"classes": {}, "count": 0}
 
     COMFY_CORE_REPO = "https://github.com/comfyanonymous/ComfyUI"
-    classes: dict[str, dict[str, str]] = {}
+    classes: dict[str, list[dict[str, str]]] = {}
     builtins: set[str] = set()
     for repo_url, payload in raw.items():
         if not isinstance(payload, list) or not payload:
@@ -175,8 +175,9 @@ async def fetch_cm_registry() -> dict[str, Any]:
             continue
         pkg = repo_url.rstrip("/").split("/")[-1].removesuffix(".git")
         for n in nodes:
-            if isinstance(n, str):
-                classes.setdefault(n, {"repo": repo_url, "pkg": pkg})
+            if not isinstance(n, str):
+                continue
+            classes.setdefault(n, []).append({"repo": repo_url, "pkg": pkg})
     return {
         "classes": classes,
         "builtins": sorted(builtins),
@@ -424,10 +425,31 @@ def _classify_node(class_name: str) -> dict | None:
     # explicit ComfyUI-core node → builtin
     if class_name in cm_obj.get("builtins", []):
         return None
-    cm = cm_obj.get("classes", {}).get(class_name)
-    if cm:
-        return {"source": "cm", "pkg": cm["pkg"], "repo": cm["repo"]}
-    return None
+    cm_entries = cm_obj.get("classes", {}).get(class_name)
+    if not cm_entries:
+        return None
+    # CM may catalog the same class under several repos (forks, copies).
+    # Prefer an entry whose pkg name matches a package already in user's S3.
+    # Normalise both sides (lowercase, alnum-only) so "ComfyUI_LayerStyle"
+    # and "comfyui-layer-style" match.
+    def _norm(s: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", s.lower())
+
+    s3_pkgs_norm = {
+        _norm(p): p for p in S3_INDEX.get("nodes", {}).get("packages", [])
+    }
+    preferred = None
+    for e in cm_entries:
+        if _norm(e["pkg"]) in s3_pkgs_norm:
+            # Override CM pkg with the actual S3 directory name so syncs
+            # target the right key.
+            actual_pkg = s3_pkgs_norm[_norm(e["pkg"])]
+            return {
+                "source": "s3",  # promote: it IS in S3, just had naming variance
+                "pkg": actual_pkg,
+            }
+    chosen = preferred or cm_entries[0]
+    return {"source": "cm", "pkg": chosen["pkg"], "repo": chosen["repo"]}
 
 
 # ---------- workflow extractors (now index-driven) ----------
