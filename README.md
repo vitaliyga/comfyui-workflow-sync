@@ -20,7 +20,6 @@ cd comfyui-workflow-sync
 uv sync
 cp .env.example .env
 $EDITOR .env       # fill in AWS keys, COMFYUI_PATH, S3 bases
-$EDITOR config.yaml  # tweak node_packages / builtin_nodes for your install
 ```
 
 `.env` keys:
