@@ -19,6 +19,16 @@ ROOT = Path(__file__).parent
 CONFIG_PATH = Path(os.environ.get("CONFIG", ROOT / "config.yaml"))
 
 
+_ENV_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _expand_env(v: str) -> str:
+    def repl(m: re.Match) -> str:
+        name = m.group(1) or m.group(2)
+        return os.environ.get(name, "")
+    return _ENV_VAR_RE.sub(repl, v)
+
+
 def load_dotenv(path: Path) -> None:
     if not path.exists():
         return
@@ -28,8 +38,14 @@ def load_dotenv(path: Path) -> None:
             continue
         k, _, v = line.partition("=")
         k, v = k.strip(), v.strip().strip('"').strip("'")
-        if k:
-            os.environ.setdefault(k, v)
+        if not k:
+            continue
+        v = _expand_env(v)
+        # empty values from unresolved ${VAR} are skipped so a real env
+        # var from the platform wins instead of being clobbered
+        if v == "":
+            continue
+        os.environ.setdefault(k, v)
 
 
 load_dotenv(ROOT / ".env")
@@ -91,6 +107,11 @@ _NCM_KEY_RE = re.compile(r"""["']([^"']+)["']\s*:""")
 # from .module import NODE_CLASS_MAPPINGS  (or with *, or rename)
 _NCM_REEXPORT_RE = re.compile(
     r"from\s+\.([\w.]+)\s+import\s+(?:[^#\n]*?)(NODE_CLASS_MAPPINGS|\*)",
+)
+# from . import foo, bar, baz  — generic submodule import; each candidate
+# may carry its own NODE_CLASS_MAPPINGS.
+_NCM_SUBMOD_RE = re.compile(
+    r"from\s+\.\s+import\s+([\w,\s]+)",
 )
 
 S3_INDEX: dict[str, Any] = {
@@ -215,6 +236,14 @@ async def _fetch_pkg_class_names(pkg: str) -> list[str]:
                 p2 = mod.replace(".", "/") + "/__init__.py"
                 if p2 not in seen_paths:
                     next_queue.append(p2)
+            # generic `from . import a, b, c` — try each submodule
+            for group in _NCM_SUBMOD_RE.findall(text):
+                for name in (n.strip() for n in group.split(",")):
+                    if not name:
+                        continue
+                    for cand in (f"{name}.py", f"{name}/__init__.py"):
+                        if cand not in seen_paths:
+                            next_queue.append(cand)
         if collected:
             break  # got something from this package, stop crawling
         queue = next_queue

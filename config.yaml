@@ -1,21 +1,12 @@
-# Path to local ComfyUI install: set COMFYUI_PATH in .env.
-# (You can still override here as a fallback.)
-
-# node_type -> [widget_index, folder under models/]
-model_node_map:
-  CheckpointLoaderSimple: [0, checkpoints]
-  UNETLoader:             [0, unet]
-  CLIPLoader:             [0, clip]
-  DualCLIPLoader:         [0, clip]
-  TripleCLIPLoader:       [0, clip]
-  VAELoader:              [0, vae]
-  "Load Lora":            [0, loras]
-  LoraLoader:             [0, loras]
-  LoraLoaderModelOnly:    [0, loras]
-  SeedVR2LoadDiTModel:    [0, unet]
-  SeedVR2LoadVAEModel:    [0, vae]
-  ControlNetLoader:       [0, controlnet]
-  UpscaleModelLoader:     [0, upscale_models]
+# All node→package and filename→folder mapping is auto-discovered from S3
+# via index_models() / index_nodes() in main.py. Re-built on first /analyze
+# and refreshed every INDEX_TTL seconds (default 24h) or via POST /reindex.
+#
+# The keys below are now OPTIONAL — fill them only if the index misses
+# something specific:
+#   model_node_map — folder hint for basename collisions (rare).
+#   node_packages  — substring→package override for nodes whose
+#                    NODE_CLASS_MAPPINGS the parser can't follow.
 
 model_extensions:
   - .safetensors
@@ -25,40 +16,17 @@ model_extensions:
   - .ckpt
   - .pth
 
-# Just the list of folders that exist under models/.
-# Full S3 URL is built as: ${S3_MODELS_BASE}/<folder>/<file>
-model_folders:
-  - checkpoints
-  - loras
-  - vae
-  - clip
-  - unet
-  - controlnet
-  - upscale_models
+# Optional disambiguation hints: when multiple models in S3 share a basename,
+# this tells us which folder a given loader node refers to. Format:
+#   <node_class>: [<widget_index_legacy>, <folder>]
+model_node_map: {}
 
-# substring(node_type) -> package directory name under custom_nodes/
-# Full S3 URL is built as: ${S3_NODES_BASE}/<package>/
-node_packages:
-  rgthree:                 rgthree-comfy
-  LayerUtility:            ComfyUI-LayerStyle
-  SeedVR2:                 SeedVR2
-  DepthAnythingV2:         comfyui-depth-anything-v2
-  OpenposePreprocessor:    comfyui_controlnet_aux
-  "RIFE VFI":              ComfyUI-Frame-Interpolation
-  PainterI2V:              ComfyUI-PainterI2V
-  easy:                    ComfyUI-Easy-Use
-  "CR ":                   ComfyUI_Comfyroll_CustomNodes
-  ImageConcatMulti:        ComfyUI-tbox
-  ImageConcanate:          ComfyUI-tbox
-  GrowMaskWithBlur:        ComfyUI-KJNodes
-  GetNode:                 ComfyUI-KJNodes
-  SetNode:                 ComfyUI-KJNodes
-  "Mask Fill Holes":       ComfyUI_essentials
-  MaskPreview+:            ComfyUI_essentials
-  ImageScaleToTotalPixels: ComfyUI_essentials
-  ImageScaleToMaxDimension: ComfyUI_essentials
-  PromptLoopNode:          ComfyUI-Custom-Scripts
+# Optional package overrides for nodes not auto-discoverable from
+# NODE_CLASS_MAPPINGS in __init__.py / nodes.py. Substring match against
+# class_type. Format: <substring>: <package_dir_under_custom_nodes/>
+node_packages: {}
 
+# Stock ComfyUI nodes — skipped during custom-node detection.
 builtin_nodes:
   - KSampler
   - KSamplerSelect
@@ -109,6 +77,7 @@ builtin_nodes:
   - ControlNetApplyAdvanced
   - UpscaleModelLoader
   - ImageUpscaleWithModel
+  - CLIPVisionLoader
   - ConditioningConcat
   - ConditioningCombine
   - ConditioningSetArea
