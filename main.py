@@ -110,17 +110,19 @@ JOBS: dict[str, dict[str, Any]] = {}
 
 INDEX_PATH = ROOT / ".s3-index.json"
 INDEX_TTL = float(os.environ.get("INDEX_TTL", str(24 * 3600)))
-_NCM_BLOCK_RE = re.compile(
-    r"NODE_CLASS_MAPPINGS\s*(?::\s*[^=]+)?=\s*\{(.*?)\n\}",
+# Catch ANY *CLASS_MAPPINGS = { ... } literal — covers the common
+# ComfyUI_essentials pattern where NODE_CLASS_MAPPINGS is empty and the
+# actual keys live in IMAGE_CLASS_MAPPINGS, MASK_CLASS_MAPPINGS, etc.
+_ANY_CM_BLOCK_RE = re.compile(
+    r"\b\w*CLASS_MAPPINGS\b\s*(?::\s*[^=]+)?=\s*\{(.*?)\n\}",
     re.DOTALL,
 )
 _NCM_KEY_RE = re.compile(r"""["']([^"']+)["']\s*:""")
-# from .module import NODE_CLASS_MAPPINGS  (or with *, or rename)
+# from .module import ANYTHING_CLASS_MAPPINGS  (or NODE_CLASS_MAPPINGS, or *)
 _NCM_REEXPORT_RE = re.compile(
-    r"from\s+\.([\w.]+)\s+import\s+(?:[^#\n]*?)(NODE_CLASS_MAPPINGS|\*)",
+    r"from\s+\.([\w.]+)\s+import\s+([^#\n]+)",
 )
-# from . import foo, bar, baz  — generic submodule import; each candidate
-# may carry its own NODE_CLASS_MAPPINGS.
+# from . import foo, bar, baz  — generic submodule import
 _NCM_SUBMOD_RE = re.compile(
     r"from\s+\.\s+import\s+([\w,\s]+)",
 )
@@ -252,8 +254,9 @@ async def index_models() -> dict[str, Any]:
 
 
 def _parse_ncm_keys(text: str) -> list[str]:
+    """Pull keys from ANY *CLASS_MAPPINGS dict literal in the source."""
     out: list[str] = []
-    for m in _NCM_BLOCK_RE.finditer(text):
+    for m in _ANY_CM_BLOCK_RE.finditer(text):
         out.extend(_NCM_KEY_RE.findall(m.group(1)))
     return out
 
@@ -290,8 +293,15 @@ async def _fetch_pkg_class_names(pkg: str) -> list[str]:
             if keys:
                 collected.extend(keys)
                 continue  # inline mapping found here — don't chase reexports
-            # only follow imports when this file had no inline mapping
-            for mod, _what in _NCM_REEXPORT_RE.findall(text):
+            # follow imports of anything that looks like class-mappings.
+            # cover all three patterns:
+            #   from .X import NODE_CLASS_MAPPINGS
+            #   from .X import IMAGE_CLASS_MAPPINGS, MASK_CLASS_MAPPINGS, ...
+            #   from .X import *
+            for mod, imports in _NCM_REEXPORT_RE.findall(text):
+                names = imports
+                if "CLASS_MAPPINGS" not in names and "*" not in names:
+                    continue
                 p = mod.replace(".", "/") + ".py"
                 if p not in seen_paths:
                     next_queue.append(p)
