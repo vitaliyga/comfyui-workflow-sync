@@ -112,6 +112,57 @@ def extract_models(workflow: dict) -> list[dict]:
     return out
 
 
+def _is_api_format(workflow: dict) -> bool:
+    """API export: top-level dict keyed by node id strings, values with class_type."""
+    if "nodes" in workflow and isinstance(workflow["nodes"], list):
+        return False
+    for v in workflow.values():
+        if isinstance(v, dict) and "class_type" in v:
+            return True
+    return False
+
+
+def _iter_api_nodes(workflow: dict):
+    """Yield (node_id, class_type, inputs_dict) for each node in API format."""
+    for node_id, node in workflow.items():
+        if not isinstance(node, dict):
+            continue
+        ct = node.get("class_type")
+        if not ct:
+            continue
+        yield node_id, ct, node.get("inputs") or {}
+
+
+def extract_models_api(workflow: dict) -> list[dict]:
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for _id, ct, inputs in _iter_api_nodes(workflow):
+        if ct not in MODEL_NODE_MAP:
+            continue
+        _idx, folder = MODEL_NODE_MAP[ct]
+        # API uses named inputs; just scan every string value for model extensions
+        for v in inputs.values():
+            if not isinstance(v, str):
+                continue
+            if not v.lower().endswith(MODEL_EXTS):
+                continue
+            rel = v.replace("\\", "/")
+            key = (folder, rel)
+            if key in seen:
+                continue
+            seen.add(key)
+            local_path = MODELS_DIR / folder / rel
+            out.append({
+                "file": rel,
+                "folder": folder,
+                "local_path": str(local_path),
+                "exists_locally": local_path.exists(),
+                "s3_source": model_s3_url(folder, rel),
+                "s3_exists": None,
+            })
+    return out
+
+
 def match_package(node_type: str) -> str | None:
     for hint, pkg in NODE_PACKAGES.items():
         if hint in node_type:
@@ -158,13 +209,58 @@ def extract_custom_nodes(workflow: dict) -> list[dict]:
     return out
 
 
+def extract_custom_nodes_api(workflow: dict) -> list[dict]:
+    out: list[dict] = []
+    seen_pkg: set[str] = set()
+    seen_unknown: set[str] = set()
+    for _id, ct, _inputs in _iter_api_nodes(workflow):
+        if ct in BUILTIN:
+            continue
+        pkg = match_package(ct)
+        if pkg is None:
+            if ct in seen_unknown:
+                continue
+            seen_unknown.add(ct)
+            out.append({
+                "node_type": ct,
+                "package_hint": None,
+                "local_path": None,
+                "exists_locally": None,
+                "s3_source": None,
+                "s3_exists": None,
+                "status": "unknown",
+            })
+            continue
+        if pkg in seen_pkg:
+            continue
+        seen_pkg.add(pkg)
+        local_path = NODES_DIR / pkg
+        out.append({
+            "node_type": ct,
+            "package_hint": pkg,
+            "local_path": str(local_path),
+            "exists_locally": local_path.exists(),
+            "s3_source": node_s3_url(pkg),
+            "s3_exists": None,
+            "status": "ok" if local_path.exists() else "missing",
+        })
+    return out
+
+
 class AnalyzeBody(BaseModel):
     workflow: dict
 
 
 @app.post("/analyze")
 def analyze(body: AnalyzeBody):
+    if _is_api_format(body.workflow):
+        return {
+            "format": "api",
+            "models": extract_models_api(body.workflow),
+            "custom_nodes": extract_custom_nodes_api(body.workflow),
+        }
     return {
+        "format": "workflow",
         "models": extract_models(body.workflow),
         "custom_nodes": extract_custom_nodes(body.workflow),
     }
