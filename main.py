@@ -60,15 +60,26 @@ def _strip_slash(s: str) -> str:
     return s.rstrip("/")
 
 
-CFG = load_config()
+def _load_config_optional() -> dict[str, Any]:
+    if not CONFIG_PATH.exists():
+        return {}
+    try:
+        with open(CONFIG_PATH) as f:
+            return yaml.safe_load(f) or {}
+    except (yaml.YAMLError, OSError):
+        return {}
+
+
+CFG = _load_config_optional()
 _comfy_env = os.environ.get("COMFYUI_PATH")
 COMFY = Path(_comfy_env or CFG.get("comfyui_path", ""))
 if not _comfy_env and not CFG.get("comfyui_path"):
     raise RuntimeError("Set COMFYUI_PATH in .env (or comfyui_path in config.yaml)")
 MODELS_DIR = COMFY / "models"
 NODES_DIR = COMFY / "custom_nodes"
-MODEL_EXTS = tuple(CFG.get("model_extensions", [".safetensors"]))
-BUILTIN = set(CFG.get("builtin_nodes", []))
+MODEL_EXTS = tuple(CFG.get("model_extensions", [
+    ".safetensors", ".gguf", ".pt", ".bin", ".ckpt", ".pth",
+]))
 MODEL_NODE_MAP: dict[str, tuple[int, str]] = {
     k: (v[0], v[1]) for k, v in CFG.get("model_node_map", {}).items()
 }
@@ -117,8 +128,59 @@ _NCM_SUBMOD_RE = re.compile(
 S3_INDEX: dict[str, Any] = {
     "models": {"files": {}, "by_basename": {}},
     "nodes": {"classes": {}, "packages": []},
+    "cm": {"classes": {}, "count": 0},
     "indexed_at": 0,
 }
+
+CM_REGISTRY_URL = os.environ.get(
+    "CM_REGISTRY_URL",
+    "https://raw.githubusercontent.com/ltdrdata/ComfyUI-Manager/main/extension-node-map.json",
+)
+
+
+async def fetch_cm_registry() -> dict[str, Any]:
+    """Pull ComfyUI-Manager's class→repo map. Returns
+    {class_name: {repo, pkg}}."""
+    import urllib.request
+
+    def _fetch() -> bytes:
+        req = urllib.request.Request(
+            CM_REGISTRY_URL,
+            headers={"User-Agent": "comfyui-workflow-sync"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read()
+
+    try:
+        raw_bytes = await asyncio.to_thread(_fetch)
+        raw = json.loads(raw_bytes)
+    except Exception:
+        return {"classes": {}, "count": 0}
+
+    COMFY_CORE_REPO = "https://github.com/comfyanonymous/ComfyUI"
+    classes: dict[str, dict[str, str]] = {}
+    builtins: set[str] = set()
+    for repo_url, payload in raw.items():
+        if not isinstance(payload, list) or not payload:
+            continue
+        nodes = payload[0]
+        if not isinstance(nodes, list):
+            continue
+        if repo_url == COMFY_CORE_REPO:
+            for n in nodes:
+                if isinstance(n, str):
+                    builtins.add(n)
+            continue
+        pkg = repo_url.rstrip("/").split("/")[-1].removesuffix(".git")
+        for n in nodes:
+            if isinstance(n, str):
+                classes.setdefault(n, {"repo": repo_url, "pkg": pkg})
+    return {
+        "classes": classes,
+        "builtins": sorted(builtins),
+        "count": len(classes),
+        "builtin_count": len(builtins),
+    }
 
 
 def _load_index_from_disk() -> None:
@@ -291,10 +353,13 @@ async def index_nodes() -> dict[str, Any]:
 
 async def rebuild_index() -> dict[str, Any]:
     global S3_INDEX
-    models, nodes = await asyncio.gather(index_models(), index_nodes())
+    models, nodes, cm = await asyncio.gather(
+        index_models(), index_nodes(), fetch_cm_registry()
+    )
     S3_INDEX = {
         "models": models,
         "nodes": nodes,
+        "cm": cm,
         "indexed_at": time.time(),
     }
     _save_index()
@@ -324,12 +389,27 @@ def _lookup_model(filename: str, hint_folder: str | None = None) -> dict | None:
     return None
 
 
-def _lookup_package(class_name: str) -> str | None:
+def _classify_node(class_name: str) -> dict | None:
+    """Returns one of:
+      {"source":"s3",     "pkg": ...}                — in our S3
+      {"source":"override","pkg": ...}               — user's node_packages
+      {"source":"cm",     "pkg": ..., "repo": ...}   — in CM registry
+      None                                            — stock ComfyUI / unknown
+    """
     pkg = S3_INDEX.get("nodes", {}).get("classes", {}).get(class_name)
     if pkg:
-        return pkg
-    # legacy override fallback
-    return match_package(class_name)
+        return {"source": "s3", "pkg": pkg}
+    pkg = match_package(class_name)
+    if pkg:
+        return {"source": "override", "pkg": pkg}
+    cm_obj = S3_INDEX.get("cm", {})
+    # explicit ComfyUI-core node → builtin
+    if class_name in cm_obj.get("builtins", []):
+        return None
+    cm = cm_obj.get("classes", {}).get(class_name)
+    if cm:
+        return {"source": "cm", "pkg": cm["pkg"], "repo": cm["repo"]}
+    return None
 
 
 # ---------- workflow extractors (now index-driven) ----------
@@ -434,61 +514,58 @@ def match_package(node_type: str) -> str | None:
     return None
 
 
-def _build_node_row(class_name: str, seen_pkg: set, seen_unknown: set) -> dict | None:
-    pkg = _lookup_package(class_name)
-    if pkg is None:
-        if class_name in seen_unknown:
-            return None
-        seen_unknown.add(class_name)
-        return {
-            "node_type": class_name,
-            "package_hint": None,
-            "local_path": None,
-            "exists_locally": None,
-            "s3_source": None,
-            "s3_exists": None,
-            "status": "unknown",
-        }
+def _build_node_row(class_name: str, seen_pkg: set, assumed_builtin: set) -> dict | None:
+    info = _classify_node(class_name)
+    if info is None:
+        assumed_builtin.add(class_name)
+        return None
+    pkg = info["pkg"]
     if pkg in seen_pkg:
         return None
     seen_pkg.add(pkg)
     local_path = NODES_DIR / pkg
-    return {
+    source = info["source"]
+    base = {
         "node_type": class_name,
         "package_hint": pkg,
         "local_path": str(local_path),
         "exists_locally": local_path.exists(),
-        "s3_source": node_s3_url(pkg),
-        "s3_exists": None,
-        "status": "ok" if local_path.exists() else "missing",
+        "source": source,
     }
+    if source in ("s3", "override"):
+        base["s3_source"] = node_s3_url(pkg)
+        base["github_url"] = None
+        base["status"] = "ok" if local_path.exists() else "missing"
+    else:  # "cm" — known custom node but not in our S3 yet
+        base["s3_source"] = None
+        base["github_url"] = info["repo"]
+        base["status"] = "github_only"
+    return base
 
 
-def extract_custom_nodes(workflow: dict) -> list[dict]:
+def extract_custom_nodes(workflow: dict) -> tuple[list[dict], list[str]]:
     out: list[dict] = []
     seen_pkg: set[str] = set()
-    seen_unknown: set[str] = set()
+    assumed_builtin: set[str] = set()
     for node in workflow.get("nodes", []):
         nt = node.get("type")
-        if not nt or nt in BUILTIN:
+        if not nt:
             continue
-        row = _build_node_row(nt, seen_pkg, seen_unknown)
+        row = _build_node_row(nt, seen_pkg, assumed_builtin)
         if row:
             out.append(row)
-    return out
+    return out, sorted(assumed_builtin)
 
 
-def extract_custom_nodes_api(workflow: dict) -> list[dict]:
+def extract_custom_nodes_api(workflow: dict) -> tuple[list[dict], list[str]]:
     out: list[dict] = []
     seen_pkg: set[str] = set()
-    seen_unknown: set[str] = set()
+    assumed_builtin: set[str] = set()
     for _id, ct, _inputs in _iter_api_nodes(workflow):
-        if ct in BUILTIN:
-            continue
-        row = _build_node_row(ct, seen_pkg, seen_unknown)
+        row = _build_node_row(ct, seen_pkg, assumed_builtin)
         if row:
             out.append(row)
-    return out
+    return out, sorted(assumed_builtin)
 
 
 class AnalyzeBody(BaseModel):
@@ -499,15 +576,19 @@ class AnalyzeBody(BaseModel):
 async def analyze(body: AnalyzeBody):
     await ensure_index_fresh()
     if _is_api_format(body.workflow):
+        nodes, assumed = extract_custom_nodes_api(body.workflow)
         return {
             "format": "api",
             "models": extract_models_api(body.workflow),
-            "custom_nodes": extract_custom_nodes_api(body.workflow),
+            "custom_nodes": nodes,
+            "assumed_builtin": assumed,
         }
+    nodes, assumed = extract_custom_nodes(body.workflow)
     return {
         "format": "workflow",
         "models": extract_models(body.workflow),
-        "custom_nodes": extract_custom_nodes(body.workflow),
+        "custom_nodes": nodes,
+        "assumed_builtin": assumed,
     }
 
 
@@ -594,6 +675,7 @@ async def status(refresh: bool = False):
             "model_files": len(idx.get("models", {}).get("files", {})),
             "node_packages": len(idx.get("nodes", {}).get("packages", [])),
             "node_classes": len(idx.get("nodes", {}).get("classes", {})),
+            "cm_classes": idx.get("cm", {}).get("count", 0),
             "unparsed_packages": idx.get("nodes", {}).get("unparsed_packages", []),
         },
     }

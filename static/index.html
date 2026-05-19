@@ -36,6 +36,10 @@
   tr.missing td.status { color:#f66; }
   tr.ok td.status { color:#6c6; }
   tr.unknown td.status { color:#fc6; }
+  tr.github_only td.status { color:#fc6; }
+  #builtin-tail { color:#666; font-size:11px; margin-top:16px; padding:8px 12px; background:#1a1a1a; border-radius:4px; }
+  #builtin-tail summary { cursor:pointer; color:#888; }
+  #builtin-tail .list { margin-top:6px; font-family: ui-monospace, Menlo, monospace; }
   code { font: 12px ui-monospace, Menlo, monospace; color:#9cf; word-break:break-all; }
   .size { font: 12px ui-monospace, Menlo, monospace; color:#bbb; white-space:nowrap; }
   .size .pending { color:#666; }
@@ -94,6 +98,11 @@
     <tbody></tbody>
   </table>
 
+  <details id="builtin-tail" style="display:none">
+    <summary></summary>
+    <div class="list"></div>
+  </details>
+
   <div id="total"></div>
   <button id="select-all-btn" class="secondary">Select All</button>
   <button id="clear-all-btn" class="secondary">Clear All</button>
@@ -139,7 +148,7 @@ function refreshStatus() {
     const idx = s.index || {};
     const ts = idx.indexed_at ? new Date(idx.indexed_at * 1000).toLocaleString() : '—';
     meta.innerHTML = `ComfyUI: ${escHtml(s.comfyui_path)} · free disk: ${free} · parallel: ${s.parallel} · `
-      + `<span title="indexed at ${ts}">S3 index: ${idx.model_files||0} models / ${idx.node_classes||0} classes in ${idx.node_packages||0} pkgs</span> · `
+      + `<span title="indexed at ${ts}">S3: ${idx.model_files||0} models / ${idx.node_classes||0} classes — CM registry: ${idx.cm_classes||0} classes</span> · `
       + `<a href="#" id="reindex-link" style="color:#9cf">⟳ reindex</a>`;
     document.getElementById('reindex-link').addEventListener('click', async e => {
       e.preventDefault();
@@ -267,10 +276,17 @@ function render() {
     let status = '❓ Unknown';
     if (n.status === 'ok') status = '✅ OK';
     else if (n.status === 'missing') status = '🔴 Missing';
+    else if (n.status === 'github_only') status = '🟡 Not in S3';
     const syncable = n.status === 'missing' && !!n.s3_source;
     const sizeCell = syncable ? '<span class="pending">…</span>' : '—';
-    const note = n.status === 'unknown' ? '<code>not in config</code>' :
-                 (n.exists_locally ? '<code>—</code>' : `<code>${escHtml(n.s3_source || '')}</code>`);
+    let note;
+    if (n.status === 'github_only') {
+      note = `<a href="${escHtml(n.github_url)}" target="_blank" style="color:#fc6">${escHtml(n.github_url)}</a>`;
+    } else if (n.exists_locally) {
+      note = '<code>—</code>';
+    } else {
+      note = `<code>${escHtml(n.s3_source || '')}</code>`;
+    }
     tr.innerHTML = `
       ${checkboxCell(syncable)}
       <td>${escHtml(n.node_type)}</td>
@@ -281,6 +297,18 @@ function render() {
     nodesBody.appendChild(tr);
   }
   bindPicks();
+  // assumed-builtin tail
+  const tail = document.getElementById('builtin-tail');
+  const list = lastAnalysis.assumed_builtin || [];
+  if (list.length) {
+    tail.style.display = '';
+    tail.querySelector('summary').textContent =
+      `${list.length} node type${list.length===1?'':'s'} not in S3 / not in CM registry — assumed built-in`;
+    tail.querySelector('.list').textContent = list.join(', ');
+  } else {
+    tail.style.display = 'none';
+  }
+
   results.style.display = '';
   reBtn.style.display = 'none';
   syncBtn.disabled = false;

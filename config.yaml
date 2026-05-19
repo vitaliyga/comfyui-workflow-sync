@@ -1,89 +1,23 @@
-# All node→package and filename→folder mapping is auto-discovered from S3
-# via index_models() / index_nodes() in main.py. Re-built on first /analyze
-# and refreshed every INDEX_TTL seconds (default 24h) or via POST /reindex.
+# config.yaml is now OPTIONAL. The whole node→package and filename→folder
+# mapping is auto-built from:
+#   1. Your S3 bucket (indexed once, refreshed via POST /reindex or every
+#      INDEX_TTL seconds).
+#   2. ComfyUI Manager registry (extension-node-map.json from GitHub).
 #
-# The keys below are now OPTIONAL — fill them only if the index misses
-# something specific:
-#   model_node_map — folder hint for basename collisions (rare).
-#   node_packages  — substring→package override for nodes whose
-#                    NODE_CLASS_MAPPINGS the parser can't follow.
+# Anything not in either source is assumed to be a stock ComfyUI node and
+# silently skipped. The assumed-builtin list is returned in /analyze for
+# transparency.
+#
+# This file exists only for the rare overrides below. Delete it if not used.
 
-model_extensions:
-  - .safetensors
-  - .gguf
-  - .pt
-  - .bin
-  - .ckpt
-  - .pth
+# Override list of model extensions (defaults baked in if absent).
+# model_extensions: [.safetensors, .gguf, .pt, .bin, .ckpt, .pth]
 
-# Optional disambiguation hints: when multiple models in S3 share a basename,
-# this tells us which folder a given loader node refers to. Format:
-#   <node_class>: [<widget_index_legacy>, <folder>]
+# Folder hint when two models in S3 share a basename:
+#   <node_class>: [_, <preferred_folder>]
 model_node_map: {}
 
-# Optional package overrides for nodes not auto-discoverable from
-# NODE_CLASS_MAPPINGS in __init__.py / nodes.py. Substring match against
-# class_type. Format: <substring>: <package_dir_under_custom_nodes/>
+# Substring override for packages whose NODE_CLASS_MAPPINGS the parser
+# can't auto-detect AND that aren't in ComfyUI-Manager registry:
+#   <substring>: <package_dir>
 node_packages: {}
-
-# Stock ComfyUI nodes — skipped during custom-node detection.
-builtin_nodes:
-  - KSampler
-  - KSamplerSelect
-  - KSamplerAdvanced
-  - SamplerCustomAdvanced
-  - CLIPTextEncode
-  - CLIPTextEncodeSDXL
-  - VAEDecode
-  - VAEEncode
-  - VAEEncodeForInpaint
-  - LoadImage
-  - LoadImageMask
-  - SaveImage
-  - PreviewImage
-  - SaveVideo
-  - CreateVideo
-  - EmptyLatentImage
-  - EmptySD3LatentImage
-  - EmptyFlux2LatentImage
-  - LatentUpscaleBy
-  - LatentUpscale
-  - ImageScaleBy
-  - ImageScale
-  - ImagePadForOutpaint
-  - GetImageSize
-  - RandomNoise
-  - CFGGuider
-  - BasicGuider
-  - BasicScheduler
-  - ModelSamplingFlux
-  - ModelSamplingSD3
-  - ModelSamplingAuraFlow
-  - Flux2Scheduler
-  - Note
-  - MarkdownNote
-  - InpaintModelConditioning
-  - CheckpointLoaderSimple
-  - UNETLoader
-  - CLIPLoader
-  - DualCLIPLoader
-  - TripleCLIPLoader
-  - VAELoader
-  - LoraLoader
-  - LoraLoaderModelOnly
-  - "Load Lora"
-  - ControlNetLoader
-  - ControlNetApply
-  - ControlNetApplyAdvanced
-  - UpscaleModelLoader
-  - ImageUpscaleWithModel
-  - CLIPVisionLoader
-  - ConditioningConcat
-  - ConditioningCombine
-  - ConditioningSetArea
-  - ConditioningZeroOut
-  - FluxGuidance
-  - ReferenceLatent
-  - WanImageToVideo
-  - Reroute
-  - PrimitiveNode
