@@ -211,30 +211,41 @@ function showFiles(names) {
 
 async function analyzeAll(workflows) {
   lastWorkflows = workflows;
-  const analyses = await Promise.all(workflows.map(wf =>
-    fetch('/analyze', {
+  // Serialise — the backend ensure_index_fresh() coalesces concurrent
+  // calls now, but sequential keeps the work order predictable and
+  // avoids 10 parallel analyzes on a cold index.
+  const analyses = [];
+  for (const wf of workflows) {
+    const r = await fetch('/analyze', {
       method:'POST', headers:{'content-type':'application/json'},
       body: JSON.stringify({ workflow: wf })
-    }).then(r => r.json())
-  ));
+    });
+    analyses.push(await r.json());
+  }
   lastAnalysis = mergeAnalyses(analyses);
   render();
   await fetchSizes();
 }
 
 function mergeAnalyses(list) {
-  const models = new Map();   // key: folder|file
-  const nodes = new Map();    // key: package_hint || node_type
+  const models = new Map();
+  const nodes = new Map();
+  const assumed = new Set();
   for (const a of list) {
-    for (const m of a.models) {
+    for (const m of (a.models || [])) {
       models.set(`${m.folder}|${m.file}`, m);
     }
-    for (const n of a.custom_nodes) {
+    for (const n of (a.custom_nodes || [])) {
       const k = n.package_hint || `__unknown__${n.node_type}`;
       if (!nodes.has(k)) nodes.set(k, n);
     }
+    for (const b of (a.assumed_builtin || [])) assumed.add(b);
   }
-  return { models: [...models.values()], custom_nodes: [...nodes.values()] };
+  return {
+    models: [...models.values()],
+    custom_nodes: [...nodes.values()],
+    assumed_builtin: [...assumed].sort(),
+  };
 }
 
 function humanBytes(n) {

@@ -351,18 +351,26 @@ async def index_nodes() -> dict[str, Any]:
     }
 
 
+_REINDEX_LOCK = asyncio.Lock()
+
+
 async def rebuild_index() -> dict[str, Any]:
+    """Coalesces concurrent callers — only one rebuild runs at a time."""
     global S3_INDEX
-    models, nodes, cm = await asyncio.gather(
-        index_models(), index_nodes(), fetch_cm_registry()
-    )
-    S3_INDEX = {
-        "models": models,
-        "nodes": nodes,
-        "cm": cm,
-        "indexed_at": time.time(),
-    }
-    _save_index()
+    async with _REINDEX_LOCK:
+        # second waiter may find a fresh index already
+        if (time.time() - S3_INDEX.get("indexed_at", 0)) < 5:
+            return S3_INDEX
+        models, nodes, cm = await asyncio.gather(
+            index_models(), index_nodes(), fetch_cm_registry()
+        )
+        S3_INDEX = {
+            "models": models,
+            "nodes": nodes,
+            "cm": cm,
+            "indexed_at": time.time(),
+        }
+        _save_index()
     return S3_INDEX
 
 
@@ -777,9 +785,35 @@ async def s3_size(source: str) -> dict[str, Any]:
     return {"bytes": None, "files": 0, "candidates": candidates}
 
 
+SIZE_PROBE_SEM = asyncio.Semaphore(4)
+
+
+def _size_from_index(src: str) -> dict[str, Any] | None:
+    """If the URL maps onto something in our S3 index, answer from cache."""
+    # Models: index by full s3_url
+    for rec in S3_INDEX.get("models", {}).get("files", {}).values():
+        if rec.get("s3_url") == src:
+            return {"bytes": rec["bytes"], "files": 1, "candidates": []}
+    # Custom-node packages: prefix match against node_s3_url(pkg)
+    nodes_idx = S3_INDEX.get("nodes", {})
+    for pkg in nodes_idx.get("packages", []):
+        if node_s3_url(pkg) == src:
+            # We don't precompute total bytes per package; need a probe.
+            return None
+    return None
+
+
+async def _bounded_size(src: str) -> dict[str, Any]:
+    cached = _size_from_index(src)
+    if cached is not None:
+        return cached
+    async with SIZE_PROBE_SEM:
+        return await s3_size(src)
+
+
 @app.post("/size")
 async def size(body: SizeBody):
-    results = await asyncio.gather(*(s3_size(s) for s in body.sources))
+    results = await asyncio.gather(*(_bounded_size(s) for s in body.sources))
     return {"sizes": dict(zip(body.sources, results))}
 
 
