@@ -185,6 +185,9 @@ const sizeCache = {};
 const overrides = {};
 // item rows by item_index during sync
 let syncRows = [];
+// s3_source URLs that completed successfully in this session — used to
+// promote 🔵 Custom / 🔵 Picked rows to ✅ OK once they're really on disk.
+const syncedSources = new Set();
 
 const drop = document.getElementById('drop');
 const meta = document.getElementById('meta');
@@ -330,17 +333,19 @@ function render() {
   lastAnalysis.models.forEach((m, idx) => {
     const tr = document.createElement('tr');
     const needsPicker = !m.s3_source;  // model not in S3 index
-    if (m.exists_locally) tr.className = 'ok';
+    const wasSynced = m.s3_source && syncedSources.has(m.s3_source);
+    const showOk = m.exists_locally || wasSynced;
+    if (showOk) tr.className = 'ok';
     else if (needsPicker) tr.className = 'unknown';
     else if (m.status === 'overridden') tr.className = 'overridden';
     else tr.className = 'missing';
     tr.dataset.src = m.s3_source || '__noresolve_m_' + idx;
     let status;
-    if (m.exists_locally) status = '✅ OK';
+    if (showOk) status = '✅ OK';
     else if (needsPicker) status = '❌ Not on S3';
     else if (m.status === 'overridden') status = '🔵 Picked';
     else status = '🔴 Missing';
-    const syncable = !m.exists_locally && !!m.s3_source;
+    const syncable = !showOk && !!m.s3_source;
     const pickBtn = needsPicker
       ? `<button class="pick-btn" title="Browse S3" data-row-kind="model" data-row-idx="${idx}">📁</button>`
       : '';
@@ -356,13 +361,14 @@ function render() {
   // user-added custom model rows
   customRows.filter(r => r.kind === 'model').forEach(r => {
     const tr = document.createElement('tr');
-    tr.className = 'missing';
+    const done = syncedSources.has(r.s3_source);
+    tr.className = done ? 'ok' : 'missing';
     tr.dataset.src = r.s3_source;
     tr.innerHTML = `
-      ${checkboxCell(true)}
+      ${checkboxCell(!done)}
       <td>${escHtml(r.file)}</td>
       <td>${escHtml(r.folder)}</td>
-      <td class="status">🔵 Custom</td>
+      <td class="status">${done ? '✅ OK' : '🔵 Custom'}</td>
       <td class="size">${humanBytes(r.bytes)}</td>
       <td><code>${escHtml(r.s3_source)}</code></td>`;
     modelsBody.appendChild(tr);
@@ -370,13 +376,15 @@ function render() {
   nodesBody.innerHTML = '';
   lastAnalysis.custom_nodes.forEach((n, idx) => {
     const tr = document.createElement('tr');
-    tr.className = n.status;
+    const wasSynced = n.s3_source && syncedSources.has(n.s3_source);
+    tr.className = wasSynced ? 'ok' : n.status;
     tr.dataset.src = n.s3_source || '__noresolve_n_' + idx;
     let status = '❓ Unknown';
-    if (n.status === 'ok') status = '✅ OK';
+    if (wasSynced || n.status === 'ok') status = '✅ OK';
     else if (n.status === 'missing') status = '🔴 Missing';
     else if (n.status === 'github_only') status = '🟡 Not in S3';
-    const syncable = n.status === 'missing' && !!n.s3_source;
+    else if (n.status === 'overridden') status = '🔵 Picked';
+    const syncable = !wasSynced && (n.status === 'missing' || n.status === 'overridden') && !!n.s3_source;
     const sizeCell = syncable ? '<span class="pending">…</span>' : '—';
     let note;
     if (n.status === 'github_only') {
@@ -391,7 +399,7 @@ function render() {
       ? `<button class="pick-btn" title="Browse S3" data-row-kind="node" data-row-idx="${idx}">📁</button>`
       : '';
     tr.innerHTML = `
-      ${checkboxCell(syncable || n.status === 'overridden')}
+      ${checkboxCell(syncable)}
       <td>${escHtml(n.node_type)}</td>
       <td>${escHtml(n.package_hint || '—')}</td>
       <td class="status">${status} ${pickBtn}</td>
@@ -402,13 +410,14 @@ function render() {
   // user-added custom node rows
   customRows.filter(r => r.kind === 'node').forEach(r => {
     const tr = document.createElement('tr');
-    tr.className = 'missing';
+    const done = syncedSources.has(r.s3_source);
+    tr.className = done ? 'ok' : 'missing';
     tr.dataset.src = r.s3_source;
     tr.innerHTML = `
-      ${checkboxCell(true)}
+      ${checkboxCell(!done)}
       <td>—</td>
       <td>${escHtml(r.pkg)}</td>
-      <td class="status">🔵 Custom</td>
+      <td class="status">${done ? '✅ OK' : '🔵 Custom'}</td>
       <td class="size"><span class="pending">…</span></td>
       <td><code>${escHtml(r.s3_source)}</code></td>`;
     nodesBody.appendChild(tr);
@@ -623,7 +632,9 @@ syncBtn.addEventListener('click', async () => {
   cons.textContent = '';
   syncRows = items.map(it => {
     const row = document.querySelector(`tr[data-src="${cssEscape(it.s3_source)}"]`);
-    return row ? attachProgress(row, it.expected_bytes) : null;
+    const handle = row ? attachProgress(row, it.expected_bytes) : {};
+    handle.src = it.s3_source;
+    return handle;
   });
 
   const r = await fetch('/sync', {
@@ -667,7 +678,10 @@ syncBtn.addEventListener('click', async () => {
       }
     } else if (msg.event === 'exit') {
       const r = syncRows[msg.item_index];
-      if (r) r.fill.style.width = msg.exit_code === 0 ? '100%' : r.fill.style.width;
+      if (r) {
+        if (r.fill) r.fill.style.width = msg.exit_code === 0 ? '100%' : r.fill.style.width;
+        if (msg.exit_code === 0 && r.src) syncedSources.add(r.src);
+      }
       cons.textContent += `[exit ${msg.exit_code}]\n`;
     } else if (msg.event === 'error') {
       cons.textContent += `[error] ${msg.message}\n`;
