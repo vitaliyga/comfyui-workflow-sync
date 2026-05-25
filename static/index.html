@@ -622,15 +622,13 @@ syncBtn.addEventListener('click', async () => {
   cons.style.display = '';
   cons.textContent = '';
   syncRows = items.map(it => {
-    const row = document.querySelector(`tr[data-src="${cssEscape(it._row_key)}"]`);
+    const row = document.querySelector(`tr[data-src="${cssEscape(it.s3_source)}"]`);
     return row ? attachProgress(row, it.expected_bytes) : null;
   });
-  // strip _row_key before sending
-  const payload = items.map(({_row_key, ...rest}) => rest);
 
   const r = await fetch('/sync', {
     method:'POST', headers:{'content-type':'application/json'},
-    body: JSON.stringify({ items: payload })
+    body: JSON.stringify({ items })
   });
   if (!r.ok) {
     const err = await r.json().catch(() => ({ detail: r.statusText }));
