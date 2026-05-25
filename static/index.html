@@ -71,6 +71,52 @@
   .banner.ok    { background:#1a2a1a; border-color:#363; color:#9c6; }
   button.danger { background:#a33; }
   .stalled { color:#fc6; font-size:11px; margin-left:6px; }
+  .pick-btn {
+    background:none; border:0; color:#9cf; cursor:pointer; font-size:13px;
+    padding:0 4px; margin:0;
+  }
+  .pick-btn:hover { color:#fc6; }
+  #picker {
+    display:none; position:fixed; inset:0; background:rgba(0,0,0,.7);
+    z-index:1000; align-items:center; justify-content:center;
+  }
+  #picker.open { display:flex; }
+  #picker .modal {
+    background:#1a1a1a; border-radius:6px; width:680px; max-width:92vw;
+    max-height:80vh; display:flex; flex-direction:column;
+  }
+  #picker .head {
+    padding:12px 16px; border-bottom:1px solid #333;
+    display:flex; gap:8px; align-items:center;
+  }
+  #picker .crumbs {
+    flex:1; font:12px ui-monospace, Menlo, monospace; color:#9cf;
+    word-break:break-all;
+  }
+  #picker .close {
+    background:#333; color:#ddd; border:0; padding:4px 10px; border-radius:3px;
+    cursor:pointer;
+  }
+  #picker .list { padding:8px 0; overflow-y:auto; flex:1; }
+  #picker .item {
+    padding:6px 16px; display:flex; gap:10px; align-items:center;
+    cursor:pointer; font-size:13px;
+  }
+  #picker .item:hover { background:#2a2a2a; }
+  #picker .item .ico { width:18px; text-align:center; }
+  #picker .item .sz { color:#888; font:11px ui-monospace, Menlo, monospace; margin-left:auto; }
+  #picker .actions {
+    padding:10px 16px; border-top:1px solid #333; display:flex; gap:8px;
+    align-items:center; flex-wrap:wrap;
+  }
+  #picker .actions .hint { color:#888; font-size:11px; margin-right:auto; }
+  #picker .pick-here {
+    background:#2a5; color:#fff; border:0; padding:6px 12px; border-radius:3px;
+    cursor:pointer;
+  }
+  #picker .pick-here:disabled { background:#444; cursor:not-allowed; }
+  #add-row-btn { background:#36c; }
+  tr.overridden td.status { color:#9cf; }
 </style>
 </head>
 <body>
@@ -109,6 +155,21 @@
   <button id="sync-btn">Sync Selected</button>
   <button id="stop-btn" class="danger" style="display:none">Stop</button>
   <button id="reanalyze-btn" class="secondary" style="display:none">Re-analyze</button>
+  <button id="add-row-btn" class="secondary">+ Add path</button>
+</div>
+
+<div id="picker">
+  <div class="modal">
+    <div class="head">
+      <span class="crumbs"></span>
+      <button class="close">✕</button>
+    </div>
+    <div class="list"></div>
+    <div class="actions">
+      <span class="hint"></span>
+      <button class="pick-here" disabled>Use this folder</button>
+    </div>
+  </div>
 </div>
 
 <pre id="console"></pre>
@@ -116,6 +177,8 @@
 <script>
 let lastAnalysis = null;
 let lastWorkflows = [];
+// extra rows the user added manually via "+ Add path"
+const customRows = [];   // [{kind:'model'|'node', s3_source, local_dest, bytes}]
 // s3_source -> { bytes, files, candidates }
 const sizeCache = {};
 // s3_source -> overridden s3_source (when user picks a candidate)
@@ -264,26 +327,51 @@ function checkboxCell(syncable) {
 
 function render() {
   modelsBody.innerHTML = '';
-  for (const m of lastAnalysis.models) {
+  lastAnalysis.models.forEach((m, idx) => {
     const tr = document.createElement('tr');
-    tr.className = m.exists_locally ? 'ok' : 'missing';
-    tr.dataset.src = m.s3_source || '';
-    const status = m.exists_locally ? '✅ OK' : '🔴 Missing';
+    const needsPicker = !m.s3_source;  // model not in S3 index
+    if (m.exists_locally) tr.className = 'ok';
+    else if (needsPicker) tr.className = 'unknown';
+    else if (m.status === 'overridden') tr.className = 'overridden';
+    else tr.className = 'missing';
+    tr.dataset.src = m.s3_source || '__noresolve_m_' + idx;
+    let status;
+    if (m.exists_locally) status = '✅ OK';
+    else if (needsPicker) status = '❌ Not on S3';
+    else if (m.status === 'overridden') status = '🔵 Picked';
+    else status = '🔴 Missing';
     const syncable = !m.exists_locally && !!m.s3_source;
+    const pickBtn = needsPicker
+      ? `<button class="pick-btn" title="Browse S3" data-row-kind="model" data-row-idx="${idx}">📁</button>`
+      : '';
     tr.innerHTML = `
       ${checkboxCell(syncable)}
       <td>${escHtml(m.file)}</td>
       <td>${escHtml(m.folder)}</td>
-      <td class="status">${status}</td>
+      <td class="status">${status} ${pickBtn}</td>
       <td class="size">${m.exists_locally ? '—' : '<span class="pending">…</span>'}</td>
       <td><code>${m.exists_locally ? '—' : escHtml(m.s3_source || '')}</code></td>`;
     modelsBody.appendChild(tr);
-  }
+  });
+  // user-added custom model rows
+  customRows.filter(r => r.kind === 'model').forEach(r => {
+    const tr = document.createElement('tr');
+    tr.className = 'missing';
+    tr.dataset.src = r.s3_source;
+    tr.innerHTML = `
+      ${checkboxCell(true)}
+      <td>${escHtml(r.file)}</td>
+      <td>${escHtml(r.folder)}</td>
+      <td class="status">🔵 Custom</td>
+      <td class="size">${humanBytes(r.bytes)}</td>
+      <td><code>${escHtml(r.s3_source)}</code></td>`;
+    modelsBody.appendChild(tr);
+  });
   nodesBody.innerHTML = '';
-  for (const n of lastAnalysis.custom_nodes) {
+  lastAnalysis.custom_nodes.forEach((n, idx) => {
     const tr = document.createElement('tr');
     tr.className = n.status;
-    tr.dataset.src = n.s3_source || '';
+    tr.dataset.src = n.s3_source || '__noresolve_n_' + idx;
     let status = '❓ Unknown';
     if (n.status === 'ok') status = '✅ OK';
     else if (n.status === 'missing') status = '🔴 Missing';
@@ -298,15 +386,43 @@ function render() {
     } else {
       note = `<code>${escHtml(n.s3_source || '')}</code>`;
     }
+    const needsPicker = n.status === 'github_only';
+    const pickBtn = needsPicker
+      ? `<button class="pick-btn" title="Browse S3" data-row-kind="node" data-row-idx="${idx}">📁</button>`
+      : '';
     tr.innerHTML = `
-      ${checkboxCell(syncable)}
+      ${checkboxCell(syncable || n.status === 'overridden')}
       <td>${escHtml(n.node_type)}</td>
       <td>${escHtml(n.package_hint || '—')}</td>
-      <td class="status">${status}</td>
+      <td class="status">${status} ${pickBtn}</td>
       <td class="size">${sizeCell}</td>
       <td>${note}</td>`;
     nodesBody.appendChild(tr);
-  }
+  });
+  // user-added custom node rows
+  customRows.filter(r => r.kind === 'node').forEach(r => {
+    const tr = document.createElement('tr');
+    tr.className = 'missing';
+    tr.dataset.src = r.s3_source;
+    tr.innerHTML = `
+      ${checkboxCell(true)}
+      <td>—</td>
+      <td>${escHtml(r.pkg)}</td>
+      <td class="status">🔵 Custom</td>
+      <td class="size"><span class="pending">…</span></td>
+      <td><code>${escHtml(r.s3_source)}</code></td>`;
+    nodesBody.appendChild(tr);
+  });
+  // wire pick buttons
+  document.querySelectorAll('.pick-btn').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      const kind = btn.dataset.rowKind;
+      const idx = Number(btn.dataset.rowIdx);
+      const mode = kind === 'model' ? 'file' : 'folder';
+      openPicker(mode, null, picked => applyOverride(kind, idx, picked));
+    });
+  });
   bindPicks();
   // assumed-builtin tail
   const tail = document.getElementById('builtin-tail');
@@ -331,10 +447,15 @@ function render() {
 async function fetchSizes() {
   const sources = [];
   for (const m of lastAnalysis.models) {
-    if (!m.exists_locally && m.s3_source) sources.push(m.s3_source);
+    if (!m.exists_locally && m.s3_source && !sizeCache[m.s3_source]) sources.push(m.s3_source);
   }
   for (const n of lastAnalysis.custom_nodes) {
-    if (n.status === 'missing' && n.s3_source) sources.push(n.s3_source);
+    if (['missing','overridden'].includes(n.status) && n.s3_source && !sizeCache[n.s3_source]) {
+      sources.push(n.s3_source);
+    }
+  }
+  for (const r of customRows) {
+    if (!sizeCache[r.s3_source]) sources.push(r.s3_source);
   }
   if (!sources.length) {
     totalEl.textContent = 'Nothing to download.';
@@ -429,23 +550,31 @@ function buildSyncItems() {
     if (m.exists_locally || !m.s3_source) continue;
     if (!isPicked(m.s3_source)) continue;
     const sz = sizeCache[m.s3_source];
-    if (!sz || sz.bytes == null) continue;  // not on S3, skip
+    if (!sz || sz.bytes == null) continue;
     const src = overrides[m.s3_source] || m.s3_source;
     items.push({
       s3_source: src, local_dest: m.local_path, is_file: true,
       expected_bytes: sz.bytes,
-      _row_key: m.s3_source,
     });
   }
   for (const n of lastAnalysis.custom_nodes) {
-    if (n.status !== 'missing' || !n.s3_source) continue;
+    if (!['missing','overridden'].includes(n.status) || !n.s3_source) continue;
     if (!isPicked(n.s3_source)) continue;
     const sz = sizeCache[n.s3_source];
     if (!sz || sz.bytes == null) continue;
     items.push({
       s3_source: n.s3_source, local_dest: n.local_path, is_file: false,
       expected_bytes: sz.bytes,
-      _row_key: n.s3_source,
+    });
+  }
+  for (const r of customRows) {
+    if (!isPicked(r.s3_source)) continue;
+    const sz = sizeCache[r.s3_source];
+    items.push({
+      s3_source: r.s3_source,
+      local_dest: r.local_dest,
+      is_file: r.kind === 'model',
+      expected_bytes: sz ? sz.bytes : r.bytes,
     });
   }
   return items;
@@ -561,6 +690,149 @@ syncBtn.addEventListener('click', async () => {
 });
 
 reBtn.addEventListener('click', () => analyzeAll(lastWorkflows));
+
+// ---- S3 picker modal ----
+const picker = document.getElementById('picker');
+const pickerCrumbs = picker.querySelector('.crumbs');
+const pickerList = picker.querySelector('.list');
+const pickerHere = picker.querySelector('.pick-here');
+const pickerHint = picker.querySelector('.hint');
+let pickerState = { mode: null, prefix: null, onPick: null };
+
+picker.querySelector('.close').addEventListener('click', closePicker);
+picker.addEventListener('click', e => { if (e.target === picker) closePicker(); });
+
+function closePicker() {
+  picker.classList.remove('open');
+  pickerState = { mode: null, prefix: null, onPick: null };
+}
+
+async function openPicker(mode, startPrefix, onPick) {
+  // mode: 'file' (only files selectable) | 'folder' (only folders) | 'any'
+  pickerState = { mode, prefix: startPrefix || '', onPick };
+  pickerHint.textContent = mode === 'file'
+    ? 'click a file to select'
+    : mode === 'folder'
+    ? 'navigate into a folder and click "Use this folder"'
+    : 'pick a file or use the current folder';
+  pickerHere.style.display = mode === 'file' ? 'none' : '';
+  picker.classList.add('open');
+  await loadPickerDir(startPrefix || '');
+}
+
+async function loadPickerDir(prefix) {
+  pickerList.innerHTML = '<div class="item">loading…</div>';
+  const u = prefix ? `/browse?prefix=${encodeURIComponent(prefix)}` : '/browse';
+  const r = await fetch(u);
+  if (!r.ok) {
+    pickerList.innerHTML = `<div class="item" style="color:#f66">error: ${r.status}</div>`;
+    return;
+  }
+  const d = await r.json();
+  pickerState.prefix = d.prefix;
+  pickerCrumbs.textContent = d.prefix;
+  pickerHere.disabled = pickerState.mode === 'file';
+  pickerHere.onclick = () => {
+    pickerState.onPick({ kind: 'folder', s3: d.prefix });
+    closePicker();
+  };
+  pickerList.innerHTML = '';
+  if (d.parent) {
+    const up = document.createElement('div');
+    up.className = 'item';
+    up.innerHTML = '<span class="ico">⤴</span><span>..</span>';
+    up.onclick = () => loadPickerDir(d.parent);
+    pickerList.appendChild(up);
+  }
+  for (const f of d.folders) {
+    const row = document.createElement('div');
+    row.className = 'item';
+    row.innerHTML = `<span class="ico">📁</span><span>${escHtml(f)}/</span>`;
+    row.onclick = () => loadPickerDir(d.prefix + f + '/');
+    pickerList.appendChild(row);
+  }
+  if (pickerState.mode !== 'folder') {
+    for (const f of d.files) {
+      const row = document.createElement('div');
+      row.className = 'item';
+      row.innerHTML = `<span class="ico">📄</span><span>${escHtml(f.name)}</span>`
+        + `<span class="sz">${humanBytes(f.size)}</span>`;
+      row.onclick = () => {
+        pickerState.onPick({ kind: 'file', s3: d.prefix + f.name, bytes: f.size });
+        closePicker();
+      };
+      pickerList.appendChild(row);
+    }
+  }
+}
+
+// ---- override existing row's s3_source via picker ----
+function applyOverride(rowKind, originalIdx, picked) {
+  const list = rowKind === 'model' ? lastAnalysis.models : lastAnalysis.custom_nodes;
+  const row = list[originalIdx];
+  row.s3_source = picked.s3;
+  if (picked.bytes != null) {
+    sizeCache[picked.s3] = { bytes: picked.bytes, files: 1, candidates: [] };
+  }
+  // for models, derive local_path from picked file
+  if (rowKind === 'model' && picked.kind === 'file') {
+    const parts = picked.s3.split('/');
+    const filename = parts[parts.length - 1];
+    // best-effort: drop into models/<folder>/<file> where <folder> is the last
+    // path segment before the file
+    const folder = parts[parts.length - 2] || 'misc';
+    row.folder = folder;
+    row.file = filename;
+    row.local_path = lastStatus.comfyui_path + '/models/' + folder + '/' + filename;
+    row.exists_locally = false;
+  }
+  if (rowKind === 'node' && picked.kind === 'folder') {
+    const parts = picked.s3.replace(/\/$/,'').split('/');
+    const pkg = parts[parts.length - 1];
+    row.package_hint = pkg;
+    row.local_path = lastStatus.comfyui_path + '/custom_nodes/' + pkg;
+    row.exists_locally = false;
+    row.status = 'overridden';
+  }
+  if (rowKind === 'model') row.s3_exists = true;
+  render();
+  fetchSizes();
+}
+
+// stash last status for path building
+let lastStatus = { comfyui_path: '/workspace/ComfyUI' };
+fetch('/status').then(r=>r.json()).then(s => { lastStatus = s; });
+
+// ---- "+ Add path" button ----
+document.getElementById('add-row-btn').addEventListener('click', () => {
+  openPicker('any', null, picked => {
+    if (picked.kind === 'file') {
+      const parts = picked.s3.split('/');
+      const filename = parts[parts.length - 1];
+      const folder = parts[parts.length - 2] || 'misc';
+      customRows.push({
+        kind: 'model',
+        s3_source: picked.s3,
+        local_dest: `${lastStatus.comfyui_path}/models/${folder}/${filename}`,
+        bytes: picked.bytes,
+        file: filename, folder,
+      });
+    } else {
+      const parts = picked.s3.replace(/\/$/,'').split('/');
+      const pkg = parts[parts.length - 1];
+      customRows.push({
+        kind: 'node',
+        s3_source: picked.s3,
+        local_dest: `${lastStatus.comfyui_path}/custom_nodes/${pkg}`,
+        bytes: null,
+        pkg,
+      });
+    }
+    if (!lastAnalysis) lastAnalysis = { models: [], custom_nodes: [], assumed_builtin: [] };
+    render();
+    fetchSizes();
+  });
+});
 </script>
 </body>
 </html>

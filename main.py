@@ -721,6 +721,46 @@ async def status(refresh: bool = False):
     }
 
 
+def _resolve_browse_prefix(p: str | None) -> str:
+    """If caller passed a bucket-relative path or empty, expand to a sensible
+    default. Always returns an s3:// URI ending in /."""
+    if not p:
+        # default: parent of both bases so user can choose between trees
+        base = S3_MODELS_BASE or S3_NODES_BASE or ""
+        if not base:
+            raise HTTPException(400, "no S3 base configured")
+        parent = base.rstrip("/").rsplit("/", 1)[0]
+        return parent + "/"
+    if not p.startswith("s3://"):
+        raise HTTPException(400, "prefix must start with s3://")
+    return p if p.endswith("/") else p + "/"
+
+
+@app.get("/browse")
+async def browse(prefix: str | None = None):
+    uri = _resolve_browse_prefix(prefix)
+    rc, out = await _aws_ls(uri)
+    if rc != 0:
+        raise HTTPException(404, f"cannot list {uri}")
+    folders: list[str] = []
+    files: list[dict[str, Any]] = []
+    for line in out.splitlines():
+        line = line.rstrip()
+        if line.startswith("                           PRE "):
+            folders.append(line.split("PRE ", 1)[1].rstrip("/"))
+            continue
+        parts = line.split(maxsplit=3)
+        if len(parts) == 4 and parts[2].isdigit():
+            files.append({"name": parts[3], "size": int(parts[2])})
+    parent = uri.rstrip("/").rsplit("/", 1)[0] + "/" if uri.count("/") > 3 else None
+    return {
+        "prefix": uri,
+        "parent": parent,
+        "folders": sorted(folders),
+        "files": sorted(files, key=lambda f: f["name"]),
+    }
+
+
 @app.post("/reindex")
 async def reindex():
     t0 = time.monotonic()
