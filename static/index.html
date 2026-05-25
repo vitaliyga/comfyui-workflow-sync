@@ -457,17 +457,17 @@ async function fetchSizes() {
   for (const r of customRows) {
     if (!sizeCache[r.s3_source]) sources.push(r.s3_source);
   }
-  if (!sources.length) {
-    totalEl.textContent = 'Nothing to download.';
-    return;
+  if (sources.length) {
+    const r = await fetch('/size', {
+      method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({ sources })
+    });
+    const { sizes } = await r.json();
+    Object.assign(sizeCache, sizes);
   }
-  const r = await fetch('/size', {
-    method:'POST', headers:{'content-type':'application/json'},
-    body: JSON.stringify({ sources })
-  });
-  const { sizes } = await r.json();
-  Object.assign(sizeCache, sizes);
-  for (const [src, info] of Object.entries(sizes)) {
+  // populate every row's size cell from cache (covers both freshly-fetched
+  // entries AND rows that were re-rendered but already had a cached size).
+  for (const [src, info] of Object.entries(sizeCache)) {
     const row = document.querySelector(`tr[data-src="${cssEscape(src)}"]`);
     if (!row) continue;
     const cell = row.querySelector('.size');
