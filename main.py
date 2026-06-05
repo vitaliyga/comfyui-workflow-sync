@@ -89,6 +89,24 @@ NODE_PACKAGES: dict[str, str] = CFG.get("node_packages", {})
 S3_MODELS_BASE = _strip_slash(os.environ.get("S3_MODELS_BASE", ""))
 S3_NODES_BASE = _strip_slash(os.environ.get("S3_NODES_BASE", ""))
 
+# Custom S3-compatible endpoint (Cloudflare R2, MinIO, Wasabi, …).
+# AWS CLI v2 honours AWS_ENDPOINT_URL_S3 natively, but we also inject
+# --endpoint-url explicitly so older CLI versions and edge-cases work.
+_S3_ENDPOINT = (
+    os.environ.get("AWS_ENDPOINT_URL_S3")
+    or os.environ.get("AWS_ENDPOINT_URL")
+    or ""
+).rstrip("/")
+
+
+def _aws_s3(*args: str) -> list[str]:
+    """Build an `aws s3 …` command, injecting --endpoint-url when configured."""
+    cmd = ["aws", "s3"]
+    if _S3_ENDPOINT:
+        cmd += ["--endpoint-url", _S3_ENDPOINT]
+    cmd += list(args)
+    return cmd
+
 
 def model_s3_url(folder: str, rel: str) -> str | None:
     if not S3_MODELS_BASE:
@@ -224,7 +242,7 @@ async def index_models() -> dict[str, Any]:
         return {"files": {}, "by_basename": {}}
     base = S3_MODELS_BASE.rstrip("/") + "/"
     _bucket, prefix = _split_s3(base)
-    rc, out = await _aws_text(["aws", "s3", "ls", "--recursive", base])
+    rc, out = await _aws_text(_aws_s3("ls", "--recursive", base))
     if rc != 0:
         return {"files": {}, "by_basename": {}}
     files: dict[str, dict[str, Any]] = {}
@@ -265,7 +283,7 @@ def _parse_ncm_keys(text: str) -> list[str]:
 async def _fetch_py(base: str, pkg: str, rel: str) -> str:
     """Fetch a .py file via aws s3 cp - to stdout. Empty on miss."""
     rc, text = await _aws_text(
-        ["aws", "s3", "cp", f"{base}/{pkg}/{rel}", "-"]
+        _aws_s3("cp", f"{base}/{pkg}/{rel}", "-")
     )
     return text if rc == 0 else ""
 
@@ -328,7 +346,7 @@ async def index_nodes() -> dict[str, Any]:
     if not S3_NODES_BASE:
         return {"classes": {}, "packages": []}
     base = S3_NODES_BASE.rstrip("/") + "/"
-    rc, out = await _aws_text(["aws", "s3", "ls", base])
+    rc, out = await _aws_text(_aws_s3("ls", base))
     if rc != 0:
         return {"classes": {}, "packages": []}
     packages: list[str] = []
@@ -657,13 +675,18 @@ async def preflight() -> dict[str, Any]:
     global PREFLIGHT_CACHE, PREFLIGHT_TS
     if PREFLIGHT_CACHE is not None and (time.monotonic() - PREFLIGHT_TS) < PREFLIGHT_TTL:
         return PREFLIGHT_CACHE
-    auth = await _probe(["aws", "sts", "get-caller-identity"])
+    # For S3-compatible endpoints (R2, MinIO…) STS is not available.
+    # Use `aws s3 ls` against the models bucket as the auth probe instead.
+    if _S3_ENDPOINT and S3_MODELS_BASE:
+        auth = await _probe(_aws_s3("ls", S3_MODELS_BASE + "/"))
+    else:
+        auth = await _probe(["aws", "sts", "get-caller-identity"])
     models_check = (
-        await _probe(["aws", "s3", "ls", S3_MODELS_BASE + "/"])
+        await _probe(_aws_s3("ls", S3_MODELS_BASE + "/"))
         if S3_MODELS_BASE else {"ok": False, "error": "S3_MODELS_BASE not set"}
     )
     nodes_check = (
-        await _probe(["aws", "s3", "ls", S3_NODES_BASE + "/"])
+        await _probe(_aws_s3("ls", S3_NODES_BASE + "/"))
         if S3_NODES_BASE else None
     )
     comfy_ok = COMFY.exists() and (COMFY / "models").exists()
@@ -790,7 +813,7 @@ class SizeBody(BaseModel):
 
 
 async def _aws_ls(uri: str, recursive: bool = False, summarize: bool = False) -> tuple[int, str]:
-    args = ["aws", "s3", "ls", uri]
+    args = _aws_s3("ls", uri)
     if recursive:
         args.append("--recursive")
     if summarize:
@@ -919,15 +942,15 @@ def build_command(item: SyncItem) -> list[str]:
         parent, _, filename = src.rpartition("/")
         parent += "/"
         local_dir = str(Path(item.local_dest).parent)
-        return [
-            "aws", "s3", "sync", parent, local_dir,
+        return _aws_s3(
+            "sync", parent, local_dir,
             "--exact-timestamps",
             "--exclude", "*",
             "--include", filename,
-        ]
+        )
     src = item.s3_source if item.s3_source.endswith("/") else item.s3_source + "/"
     dst = item.local_dest if item.local_dest.endswith("/") else item.local_dest + "/"
-    return ["aws", "s3", "sync", src, dst, "--exact-timestamps"]
+    return _aws_s3("sync", src, dst, "--exact-timestamps")
 
 
 _UNIT_FACTORS = {
