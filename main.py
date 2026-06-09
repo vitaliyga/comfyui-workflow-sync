@@ -605,6 +605,21 @@ def _iter_model_strings(value: Any):
             yield from _iter_model_strings(v)
 
 
+def _basename(name: str) -> str:
+    return name.replace("\\", "/").split("/")[-1]
+
+
+def _suppress_phantom_models(rows: list[dict]) -> list[dict]:
+    """Drop unresolved ("not on S3") rows when the SAME file already resolved
+    to a real S3 folder. Happens when one filename is referenced by several
+    nodes with conflicting folder hints — e.g. the LTX checkpoint passed into
+    both CheckpointLoaderSimple (→checkpoints, resolves) and the LTXV audio/
+    text-encoder loaders via ckpt_name (→vae/text_encoders, phantom misses).
+    Purely cosmetic: resolution logic is untouched, so no double downloads."""
+    resolved = {_basename(r["file"]) for r in rows if r["s3_exists"]}
+    return [r for r in rows if r["s3_exists"] or _basename(r["file"]) not in resolved]
+
+
 def extract_models(workflow: dict) -> list[dict]:
     out: list[dict] = []
     seen: set[tuple[str, str]] = set()
@@ -622,7 +637,7 @@ def extract_models(workflow: dict) -> list[dict]:
                     continue
                 seen.add(key)
                 out.append(row)
-    return out
+    return _suppress_phantom_models(out)
 
 
 def _is_api_format(workflow: dict) -> bool:
@@ -663,7 +678,7 @@ def extract_models_api(workflow: dict) -> list[dict]:
                     continue
                 seen.add(key)
                 out.append(row)
-    return out
+    return _suppress_phantom_models(out)
 
 
 def match_package(node_type: str) -> str | None:
