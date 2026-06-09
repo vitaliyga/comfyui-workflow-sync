@@ -391,7 +391,79 @@ async def ensure_index_fresh() -> None:
         await rebuild_index()
 
 
-def _lookup_model(filename: str, hint_folder: str | None = None) -> dict | None:
+# ComfyUI loader class-name substrings → the model folder(s) they load from.
+# First match wins, so more specific needles come before broader ones
+# (CLIPVision before CLIP, UpscaleModel before Upscale). Folder values are
+# matched leniently against the actual S3 folders (see _folder_matches), so
+# naming variance like vae/vae_approx or text_encoders/clip is tolerated.
+# This replaces the old config.yaml `model_node_map` — the workflow already
+# carries the node type, so the right folder is inferable without config.
+_NODE_FOLDER_HINTS: list[tuple[str, tuple[str, ...]]] = [
+    ("CLIPVision", ("clip_vision",)),
+    ("StyleModel", ("style_models",)),
+    ("ControlNet", ("controlnet",)),
+    ("Hypernetwork", ("hypernetworks",)),
+    ("GLIGEN", ("gligen",)),
+    ("UpscaleModel", ("upscale_models",)),
+    ("Upscale", ("upscale_models",)),
+    ("DualCLIP", ("text_encoders", "clip")),
+    ("TripleCLIP", ("text_encoders", "clip")),
+    ("QuadrupleCLIP", ("text_encoders", "clip")),
+    ("TextEncoder", ("text_encoders", "clip")),
+    ("CLIP", ("text_encoders", "clip")),
+    ("VAE", ("vae",)),
+    ("Lora", ("loras",)),
+    ("LoRA", ("loras",)),
+    ("UNET", ("diffusion_models", "unet")),
+    ("Unet", ("diffusion_models", "unet")),
+    ("Diffusion", ("diffusion_models", "unet")),
+    ("Checkpoint", ("checkpoints",)),
+    ("Ckpt", ("checkpoints",)),
+]
+
+# API-format input keys → folder hints (the dict key names the slot, e.g.
+# {"vae_name": "..."} on a node whose class_type we may not recognise).
+_INPUT_FOLDER_HINTS: list[tuple[str, tuple[str, ...]]] = [
+    ("clip_vision", ("clip_vision",)),
+    ("style_model", ("style_models",)),
+    ("control_net", ("controlnet",)),
+    ("controlnet", ("controlnet",)),
+    ("hypernetwork", ("hypernetworks",)),
+    ("gligen", ("gligen",)),
+    ("upscale_model", ("upscale_models",)),
+    ("vae_name", ("vae",)),
+    ("lora_name", ("loras",)),
+    ("clip_name", ("text_encoders", "clip")),
+    ("unet_name", ("diffusion_models", "unet")),
+    ("ckpt_name", ("checkpoints",)),
+]
+
+
+def _infer_folder_hints(node_type: str | None, input_key: str | None = None) -> tuple[str, ...]:
+    """Best-effort: which model folder(s) does this loader pull from?
+    Prefers an explicit config map, then the node class name, then the
+    API input-slot key. Returns folder keywords (empty = no idea)."""
+    if node_type and node_type in MODEL_NODE_MAP:
+        return (MODEL_NODE_MAP[node_type][1],)
+    if node_type:
+        nt = node_type.lower()
+        for needle, folders in _NODE_FOLDER_HINTS:
+            if needle.lower() in nt:
+                return folders
+    if input_key:
+        ik = input_key.lower()
+        for needle, folders in _INPUT_FOLDER_HINTS:
+            if needle in ik:
+                return folders
+    return ()
+
+
+def _folder_matches(folder: str, hints: tuple[str, ...]) -> bool:
+    f = folder.lower()
+    return any(f == h or f.startswith(h) for h in hints)
+
+
+def _lookup_model(filename: str, hints: tuple[str, ...] = ()) -> dict | None:
     files = S3_INDEX.get("models", {}).get("files", {})
     by_bn = S3_INDEX.get("models", {}).get("by_basename", {})
     fn = filename.replace("\\", "/")
@@ -399,12 +471,19 @@ def _lookup_model(filename: str, hint_folder: str | None = None) -> dict | None:
         return {"rel": fn, **files[fn]}
     bn = fn.split("/")[-1]
     matches = by_bn.get(bn, [])
+    if not matches:
+        return None
     if len(matches) == 1:
         return {"rel": matches[0], **files[matches[0]]}
-    if matches and hint_folder:
-        pref = [m for m in matches if files[m]["folder"] == hint_folder]
-        if len(pref) == 1:
-            return {"rel": pref[0], **files[pref[0]]}
+    # ambiguous basename (same file lives in several folders, e.g. a VAE
+    # mirrored under both checkpoints/ and vae/). Disambiguate by the folder
+    # the loader node implies.
+    if hints:
+        pref = [m for m in matches if _folder_matches(files[m]["folder"], hints)]
+        if pref:
+            # deterministic when >1 still match: shortest folder = most specific
+            best = min(pref, key=lambda m: (len(files[m]["folder"]), files[m]["folder"]))
+            return {"rel": best, **files[best]}
     return None
 
 
@@ -455,11 +534,11 @@ def _classify_node(class_name: str) -> dict | None:
 # ---------- workflow extractors (now index-driven) ----------
 
 
-def _build_model_entry(value: str, hint_folder: str | None) -> dict | None:
+def _build_model_entry(value: str, hints: tuple[str, ...]) -> dict | None:
     """Resolve a workflow model reference via S3 index; return row dict or None."""
     if not isinstance(value, str) or not value.lower().endswith(MODEL_EXTS):
         return None
-    info = _lookup_model(value, hint_folder)
+    info = _lookup_model(value, hints)
     if info:
         folder = info["folder"]
         rel = info["rel"]  # includes folder as first segment
@@ -475,8 +554,10 @@ def _build_model_entry(value: str, hint_folder: str | None) -> dict | None:
             "s3_bytes": info["bytes"],
             "s3_exists": True,
         }
-    # not in index — best-effort placeholder
+    # not in index — best-effort placeholder. Use the first hinted folder so
+    # the row at least lands in a sensible place if the user picks manually.
     bn = value.replace("\\", "/").split("/")[-1]
+    hint_folder = hints[0] if hints else None
     folder = hint_folder or "?"
     local_path = MODELS_DIR / folder / bn if hint_folder else None
     return {
@@ -495,10 +576,10 @@ def extract_models(workflow: dict) -> list[dict]:
     seen: set[tuple[str, str]] = set()
     for node in workflow.get("nodes", []):
         nt = node.get("type")
-        hint = MODEL_NODE_MAP.get(nt, (None, None))[1] if nt in MODEL_NODE_MAP else None
+        hints = _infer_folder_hints(nt)
         wv = node.get("widgets_values") or []
         for v in wv:
-            row = _build_model_entry(v, hint)
+            row = _build_model_entry(v, hints)
             if not row:
                 continue
             key = (row["folder"], row["file"])
@@ -534,9 +615,11 @@ def extract_models_api(workflow: dict) -> list[dict]:
     out: list[dict] = []
     seen: set[tuple[str, str]] = set()
     for _id, ct, inputs in _iter_api_nodes(workflow):
-        hint = MODEL_NODE_MAP.get(ct, (None, None))[1] if ct in MODEL_NODE_MAP else None
-        for v in inputs.values():
-            row = _build_model_entry(v, hint)
+        for key, v in inputs.items():
+            # API format names the slot ("vae_name", "ckpt_name", …) — use it
+            # as a second hint source after the node class_type.
+            hints = _infer_folder_hints(ct, key)
+            row = _build_model_entry(v, hints)
             if not row:
                 continue
             key = (row["folder"], row["file"])
