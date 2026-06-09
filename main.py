@@ -558,6 +558,24 @@ def _pkg_ids_from_properties(properties: dict | None):
         yield aux.rstrip("/").split("/")[-1]
 
 
+# Hardcoded class → package for extensions that neither the CM registry nor
+# the static NODE_CLASS_MAPPINGS parser surface (e.g. ComfyUI-LTXVideo, whose
+# AV / tiled-VAE nodes are unknown to CM and registered in a way the parser
+# can't read). Only the extension-specific classes are listed — NOT the LTX
+# nodes that are actually core (LTXVConditioning, …) or come from other packs
+# (LTXVChunkFeedForward → KJNodes). Resolved against the user's S3 below, so a
+# row only appears when the package really exists in the bucket.
+_KNOWN_NODE_PACKAGES: dict[str, str] = {
+    "LTXVSpatioTemporalTiledVAEDecode": "ComfyUI-LTXVideo",
+    "LTXVAudioVAEEncode": "ComfyUI-LTXVideo",
+    "LTXVAudioVAEDecode": "ComfyUI-LTXVideo",
+    "LTXVConcatAVLatent": "ComfyUI-LTXVideo",
+    "LTXVSeparateAVLatent": "ComfyUI-LTXVideo",
+    "LTXVImgToVideoInplace": "ComfyUI-LTXVideo",
+    "LTXVLatentUpsampler": "ComfyUI-LTXVideo",
+}
+
+
 def _classify_node(class_name: str, properties: dict | None = None) -> dict | None:
     """Returns one of:
       {"source":"s3",     "pkg": ...}                — in our S3
@@ -574,6 +592,12 @@ def _classify_node(class_name: str, properties: dict | None = None) -> dict | No
     #    nvidia rtx, …) whose class maps the static parser can't read.
     for cand in _pkg_ids_from_properties(properties):
         actual = _s3_pkg_exact(cand)
+        if actual:
+            return {"source": "s3", "pkg": actual}
+    # 2.5 hardcoded known-extension map (CM/parser blind spots like LTXVideo)
+    known = _KNOWN_NODE_PACKAGES.get(class_name)
+    if known:
+        actual = _s3_pkg_exact(known)
         if actual:
             return {"source": "s3", "pkg": actual}
     # 3. user override
