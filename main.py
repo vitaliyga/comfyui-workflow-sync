@@ -605,10 +605,16 @@ def _iter_model_strings(value: Any):
     plain strings, rgthree-style dicts ({"on":.., "lora":"...", ..}), and any
     nested list/dict. Non-model strings get filtered downstream by extension.
     Without this, loaders that store models in structured widgets — notably
-    the rgthree Power Lora Loader — contribute nothing to the analysis."""
+    the rgthree Power Lora Loader — contribute nothing to the analysis.
+
+    Toggleable entries that are switched OFF are skipped: an rgthree lora dict
+    with "on": False is disabled in the workflow and not actually loaded, so
+    syncing it would just be noise."""
     if isinstance(value, str):
         yield value
     elif isinstance(value, dict):
+        if value.get("on") is False:
+            return  # disabled rgthree lora slot — not loaded, skip
         for v in value.values():
             yield from _iter_model_strings(v)
     elif isinstance(value, list):
