@@ -417,6 +417,11 @@ async def ensure_index_fresh() -> None:
 # This replaces the old config.yaml `model_node_map` — the workflow already
 # carries the node type, so the right folder is inferable without config.
 _NODE_FOLDER_HINTS: list[tuple[str, tuple[str, ...]]] = [
+    # LTX "audio VAE" loader is misleading: despite "VAE" in the name it reads
+    # its file from the CHECKPOINTS folder (its widget is ckpt_name). Must come
+    # before the generic "VAE" rule. Confirmed by ComfyUI: ckpt_name dropdown
+    # is populated from models/checkpoints.
+    ("LTXVAudioVAELoader", ("checkpoints",)),
     ("CLIPVision", ("clip_vision",)),
     ("StyleModel", ("style_models",)),
     ("ControlNet", ("controlnet",)),
@@ -451,27 +456,33 @@ _INPUT_FOLDER_HINTS: list[tuple[str, tuple[str, ...]]] = [
     ("upscale_model", ("upscale_models",)),
     ("vae_name", ("vae",)),
     ("lora_name", ("loras",)),
+    ("text_encoder", ("text_encoders", "clip")),
     ("clip_name", ("text_encoders", "clip")),
     ("unet_name", ("diffusion_models", "unet")),
+    # ckpt_name is the ground-truth folder selector in ComfyUI even on nodes
+    # whose class name says otherwise (e.g. LTXVAudioVAELoader → checkpoints).
     ("ckpt_name", ("checkpoints",)),
 ]
 
 
 def _infer_folder_hints(node_type: str | None, input_key: str | None = None) -> tuple[str, ...]:
     """Best-effort: which model folder(s) does this loader pull from?
-    Prefers an explicit config map, then the node class name, then the
-    API input-slot key. Returns folder keywords (empty = no idea)."""
+    Order of authority: explicit config map → API input-slot key → node class
+    name. The slot key (ckpt_name/vae_name/clip_name/…) IS ComfyUI's folder
+    selector, so it outranks the class-name heuristic — a node can even pull
+    from different folders per slot (LTXAVTextEncoderLoader: text_encoder→
+    text_encoders, ckpt_name→checkpoints)."""
     if node_type and node_type in MODEL_NODE_MAP:
         return (MODEL_NODE_MAP[node_type][1],)
-    if node_type:
-        nt = node_type.lower()
-        for needle, folders in _NODE_FOLDER_HINTS:
-            if needle.lower() in nt:
-                return folders
     if input_key:
         ik = input_key.lower()
         for needle, folders in _INPUT_FOLDER_HINTS:
             if needle in ik:
+                return folders
+    if node_type:
+        nt = node_type.lower()
+        for needle, folders in _NODE_FOLDER_HINTS:
+            if needle.lower() in nt:
                 return folders
     return ()
 
