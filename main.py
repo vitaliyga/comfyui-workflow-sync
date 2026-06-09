@@ -571,6 +571,22 @@ def _build_model_entry(value: str, hints: tuple[str, ...]) -> dict | None:
     }
 
 
+def _iter_model_strings(value: Any):
+    """Yield candidate filename strings from a widget/input value. Handles
+    plain strings, rgthree-style dicts ({"on":.., "lora":"...", ..}), and any
+    nested list/dict. Non-model strings get filtered downstream by extension.
+    Without this, loaders that store models in structured widgets — notably
+    the rgthree Power Lora Loader — contribute nothing to the analysis."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for v in value.values():
+            yield from _iter_model_strings(v)
+    elif isinstance(value, list):
+        for v in value:
+            yield from _iter_model_strings(v)
+
+
 def extract_models(workflow: dict) -> list[dict]:
     out: list[dict] = []
     seen: set[tuple[str, str]] = set()
@@ -579,14 +595,15 @@ def extract_models(workflow: dict) -> list[dict]:
         hints = _infer_folder_hints(nt)
         wv = node.get("widgets_values") or []
         for v in wv:
-            row = _build_model_entry(v, hints)
-            if not row:
-                continue
-            key = (row["folder"], row["file"])
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(row)
+            for s in _iter_model_strings(v):
+                row = _build_model_entry(s, hints)
+                if not row:
+                    continue
+                key = (row["folder"], row["file"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(row)
     return out
 
 
@@ -615,18 +632,19 @@ def extract_models_api(workflow: dict) -> list[dict]:
     out: list[dict] = []
     seen: set[tuple[str, str]] = set()
     for _id, ct, inputs in _iter_api_nodes(workflow):
-        for key, v in inputs.items():
+        for slot, v in inputs.items():
             # API format names the slot ("vae_name", "ckpt_name", …) — use it
             # as a second hint source after the node class_type.
-            hints = _infer_folder_hints(ct, key)
-            row = _build_model_entry(v, hints)
-            if not row:
-                continue
-            key = (row["folder"], row["file"])
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(row)
+            hints = _infer_folder_hints(ct, slot)
+            for s in _iter_model_strings(v):
+                row = _build_model_entry(s, hints)
+                if not row:
+                    continue
+                key = (row["folder"], row["file"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(row)
     return out
 
 
