@@ -516,48 +516,95 @@ def _lookup_model(filename: str, hints: tuple[str, ...] = ()) -> dict | None:
     return None
 
 
-def _classify_node(class_name: str) -> dict | None:
+def _norm_pkg(s: str) -> str:
+    """Lowercase, alnum-only — so 'ComfyUI_LayerStyle' == 'comfyui-layer-style'."""
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def _s3_pkg_exact(name: str | None) -> str | None:
+    """Exact (normalised) match of a package id against S3 custom_nodes dirs.
+    Returns the real S3 directory name so syncs target the right key."""
+    if not name:
+        return None
+    norm_map = {_norm_pkg(p): p for p in S3_INDEX.get("nodes", {}).get("packages", [])}
+    return norm_map.get(_norm_pkg(name))
+
+
+def _s3_pkg_fuzzy(token: str | None) -> str | None:
+    """Find an S3 package dir that *contains* `token` (normalised) — for a
+    vendor tag like the '(rgthree)' suffix in a class name. Requires a
+    reasonably long token to avoid spurious hits."""
+    n = _norm_pkg(token or "")
+    if len(n) < 4:
+        return None
+    for p in S3_INDEX.get("nodes", {}).get("packages", []):
+        if n in _norm_pkg(p):
+            return p
+    return None
+
+
+def _pkg_ids_from_properties(properties: dict | None):
+    """Yield package identifiers a node carries about itself: ComfyUI-Manager
+    writes `cnr_id` (registry id, == the package dir) and `aux_id`
+    (owner/repo). These are authoritative — far better than reverse-looking-up
+    the class name in the CM registry, which may map one class to many forks."""
+    if not isinstance(properties, dict):
+        return
+    cnr = properties.get("cnr_id")
+    if isinstance(cnr, str) and cnr and cnr != "comfy-core":
+        yield cnr
+    aux = properties.get("aux_id")
+    if isinstance(aux, str) and "/" in aux:
+        yield aux.rstrip("/").split("/")[-1]
+
+
+def _classify_node(class_name: str, properties: dict | None = None) -> dict | None:
     """Returns one of:
       {"source":"s3",     "pkg": ...}                — in our S3
       {"source":"override","pkg": ...}               — user's node_packages
       {"source":"cm",     "pkg": ..., "repo": ...}   — in CM registry
       None                                            — stock ComfyUI / unknown
     """
+    # 1. class → pkg from the S3 static parse of NODE_CLASS_MAPPINGS
     pkg = S3_INDEX.get("nodes", {}).get("classes", {}).get(class_name)
     if pkg:
         return {"source": "s3", "pkg": pkg}
+    # 2. the node's OWN package id (cnr_id / aux_id) matched against S3 dirs.
+    #    Authoritative and survives the dynamic-registration packages (rgthree,
+    #    nvidia rtx, …) whose class maps the static parser can't read.
+    for cand in _pkg_ids_from_properties(properties):
+        actual = _s3_pkg_exact(cand)
+        if actual:
+            return {"source": "s3", "pkg": actual}
+    # 3. user override
     pkg = match_package(class_name)
     if pkg:
         return {"source": "override", "pkg": pkg}
     cm_obj = S3_INDEX.get("cm", {})
-    # explicit ComfyUI-core node → builtin
+    # 4. explicit ComfyUI-core node → builtin
     if class_name in cm_obj.get("builtins", []):
         return None
     cm_entries = cm_obj.get("classes", {}).get(class_name)
-    if not cm_entries:
-        return None
-    # CM may catalog the same class under several repos (forks, copies).
-    # Prefer an entry whose pkg name matches a package already in user's S3.
-    # Normalise both sides (lowercase, alnum-only) so "ComfyUI_LayerStyle"
-    # and "comfyui-layer-style" match.
-    def _norm(s: str) -> str:
-        return re.sub(r"[^a-z0-9]", "", s.lower())
-
-    s3_pkgs_norm = {
-        _norm(p): p for p in S3_INDEX.get("nodes", {}).get("packages", [])
-    }
-    preferred = None
-    for e in cm_entries:
-        if _norm(e["pkg"]) in s3_pkgs_norm:
-            # Override CM pkg with the actual S3 directory name so syncs
-            # target the right key.
-            actual_pkg = s3_pkgs_norm[_norm(e["pkg"])]
-            return {
-                "source": "s3",  # promote: it IS in S3, just had naming variance
-                "pkg": actual_pkg,
-            }
-    chosen = preferred or cm_entries[0]
-    return {"source": "cm", "pkg": chosen["pkg"], "repo": chosen["repo"]}
+    # 5. CM may catalog the same class under several repos (forks, copies).
+    #    Prefer an entry whose pkg already exists in the user's S3.
+    if cm_entries:
+        for e in cm_entries:
+            actual = _s3_pkg_exact(e["pkg"])
+            if actual:
+                return {"source": "s3", "pkg": actual}
+    # 6. vendor tag in the class name, e.g. "Seed (rgthree)" → rgthree-comfy.
+    #    Catches API-format nodes (no properties) whose CM entry points at the
+    #    wrong fork.
+    m = re.search(r"\(([^)]+)\)\s*$", class_name)
+    if m:
+        actual = _s3_pkg_fuzzy(m.group(1))
+        if actual:
+            return {"source": "s3", "pkg": actual}
+    # 7. known custom node, just not in our S3 yet → GitHub
+    if cm_entries:
+        chosen = cm_entries[0]
+        return {"source": "cm", "pkg": chosen["pkg"], "repo": chosen["repo"]}
+    return None
 
 
 # ---------- workflow extractors (now index-driven) ----------
@@ -705,8 +752,9 @@ def match_package(node_type: str) -> str | None:
     return None
 
 
-def _build_node_row(class_name: str, seen_pkg: set, assumed_builtin: set) -> dict | None:
-    info = _classify_node(class_name)
+def _build_node_row(class_name: str, seen_pkg: set, assumed_builtin: set,
+                    properties: dict | None = None) -> dict | None:
+    info = _classify_node(class_name, properties)
     if info is None:
         assumed_builtin.add(class_name)
         return None
@@ -742,7 +790,7 @@ def extract_custom_nodes(workflow: dict) -> tuple[list[dict], list[str]]:
         nt = node.get("type")
         if not nt:
             continue
-        row = _build_node_row(nt, seen_pkg, assumed_builtin)
+        row = _build_node_row(nt, seen_pkg, assumed_builtin, node.get("properties"))
         if row:
             out.append(row)
     return out, sorted(assumed_builtin)
