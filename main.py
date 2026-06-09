@@ -776,6 +776,25 @@ def match_package(node_type: str) -> str | None:
     return None
 
 
+def _resolve_local_node_dir(pkg: str) -> tuple[Path, bool]:
+    """Resolve a package name to its on-disk directory, tolerating case and
+    separator variance — ComfyUI loads 'ComfyUI-VideoHelperSuite' while our S3
+    dir is 'comfyui-videohelpersuite'. An exact-name miss would otherwise look
+    "missing" and a sync would create a SECOND, conflicting copy. If a
+    normalised match already exists we return that real dir (and exists=True),
+    so the package shows as OK, isn't re-synced, and a sync (if forced) targets
+    the existing dir instead of a case-variant duplicate."""
+    direct = NODES_DIR / pkg
+    if direct.exists():
+        return direct, True
+    if NODES_DIR.exists():
+        target = _norm_pkg(pkg)
+        for d in NODES_DIR.iterdir():
+            if d.is_dir() and _norm_pkg(d.name) == target:
+                return d, True
+    return direct, False
+
+
 def _build_node_row(class_name: str, seen_pkg: set, assumed_builtin: set,
                     properties: dict | None = None) -> dict | None:
     info = _classify_node(class_name, properties)
@@ -786,19 +805,19 @@ def _build_node_row(class_name: str, seen_pkg: set, assumed_builtin: set,
     if pkg in seen_pkg:
         return None
     seen_pkg.add(pkg)
-    local_path = NODES_DIR / pkg
+    local_path, exists_locally = _resolve_local_node_dir(pkg)
     source = info["source"]
     base = {
         "node_type": class_name,
         "package_hint": pkg,
         "local_path": str(local_path),
-        "exists_locally": local_path.exists(),
+        "exists_locally": exists_locally,
         "source": source,
     }
     if source in ("s3", "override"):
         base["s3_source"] = node_s3_url(pkg)
         base["github_url"] = None
-        base["status"] = "ok" if local_path.exists() else "missing"
+        base["status"] = "ok" if exists_locally else "missing"
     else:  # "cm" — known custom node but not in our S3 yet
         base["s3_source"] = None
         base["github_url"] = info["repo"]
