@@ -97,6 +97,14 @@
     background:#333; color:#ddd; border:0; padding:4px 10px; border-radius:3px;
     cursor:pointer;
   }
+  #picker .search-bar { padding:8px 12px; border-bottom:1px solid #333; }
+  #picker .search-input {
+    width:100%; box-sizing:border-box; background:#111; color:#ddd;
+    border:1px solid #444; border-radius:4px; padding:7px 10px; font-size:13px;
+  }
+  #picker .search-input:focus { outline:none; border-color:#9cf; }
+  #picker .sect { padding:4px 16px; color:#888; font-size:11px; text-transform:uppercase; }
+  #picker .item .pth { color:#666; font-size:11px; margin-left:6px; }
   #picker .list { padding:8px 0; overflow-y:auto; flex:1; }
   #picker .item {
     padding:6px 16px; display:flex; gap:10px; align-items:center;
@@ -163,6 +171,9 @@
     <div class="head">
       <span class="crumbs"></span>
       <button class="close">✕</button>
+    </div>
+    <div class="search-bar">
+      <input type="text" class="search-input" placeholder="🔎 search by name (clear to browse folders)" />
     </div>
     <div class="list"></div>
     <div class="actions">
@@ -709,10 +720,19 @@ const pickerCrumbs = picker.querySelector('.crumbs');
 const pickerList = picker.querySelector('.list');
 const pickerHere = picker.querySelector('.pick-here');
 const pickerHint = picker.querySelector('.hint');
+const pickerSearch = picker.querySelector('.search-input');
 let pickerState = { mode: null, prefix: null, onPick: null };
+let searchTimer = null;
 
 picker.querySelector('.close').addEventListener('click', closePicker);
 picker.addEventListener('click', e => { if (e.target === picker) closePicker(); });
+
+pickerSearch.addEventListener('input', () => {
+  clearTimeout(searchTimer);
+  const q = pickerSearch.value.trim();
+  if (!q) { loadPickerDir(pickerState.prefix || ''); return; }
+  searchTimer = setTimeout(() => runPickerSearch(q), 250);
+});
 
 function closePicker() {
   picker.classList.remove('open');
@@ -728,8 +748,63 @@ async function openPicker(mode, startPrefix, onPick) {
     ? 'navigate into a folder and click "Use this folder"'
     : 'pick a file or use the current folder';
   pickerHere.style.display = mode === 'file' ? 'none' : '';
+  pickerSearch.value = '';
   picker.classList.add('open');
   await loadPickerDir(startPrefix || '');
+}
+
+async function runPickerSearch(q) {
+  pickerCrumbs.textContent = `search: ${q}`;
+  pickerHere.disabled = true;
+  pickerList.innerHTML = '<div class="item">searching…</div>';
+  let d;
+  try {
+    const r = await fetch(`/search?q=${encodeURIComponent(q)}`);
+    if (!r.ok) throw new Error(r.status);
+    d = await r.json();
+  } catch (e) {
+    pickerList.innerHTML = `<div class="item" style="color:#f66">search error: ${e.message}</div>`;
+    return;
+  }
+  const files = pickerState.mode === 'folder' ? [] : (d.files || []);
+  const nodes = pickerState.mode === 'file' ? [] : (d.nodes || []);
+  pickerList.innerHTML = '';
+  if (!files.length && !nodes.length) {
+    pickerList.innerHTML = '<div class="item" style="color:#888">no matches</div>';
+    return;
+  }
+  if (files.length) {
+    const h = document.createElement('div');
+    h.className = 'sect'; h.textContent = 'Files';
+    pickerList.appendChild(h);
+  }
+  for (const f of files) {
+    const row = document.createElement('div');
+    row.className = 'item';
+    row.innerHTML = `<span class="ico">📄</span><span>${escHtml(f.name)}`
+      + `<span class="pth">${escHtml(f.folder || '')}</span></span>`
+      + `<span class="sz">${humanBytes(f.bytes)}</span>`;
+    row.onclick = () => {
+      pickerState.onPick({ kind: 'file', s3: f.s3, bytes: f.bytes });
+      closePicker();
+    };
+    pickerList.appendChild(row);
+  }
+  if (nodes.length) {
+    const h = document.createElement('div');
+    h.className = 'sect'; h.textContent = 'Custom nodes';
+    pickerList.appendChild(h);
+  }
+  for (const n of nodes) {
+    const row = document.createElement('div');
+    row.className = 'item';
+    row.innerHTML = `<span class="ico">📦</span><span>${escHtml(n.name)}/</span>`;
+    row.onclick = () => {
+      pickerState.onPick({ kind: 'folder', s3: n.s3 });
+      closePicker();
+    };
+    pickerList.appendChild(row);
+  }
 }
 
 async function loadPickerDir(prefix) {

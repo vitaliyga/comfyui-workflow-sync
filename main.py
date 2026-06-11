@@ -1021,6 +1021,45 @@ async def reindex():
     }
 
 
+@app.get("/search")
+async def search(q: str = "", limit: int = 100):
+    """Substring search over the S3 index — model files (by name/path) and
+    custom-node packages. Lets the picker jump straight to a match instead of
+    navigating folders. Case-insensitive."""
+    await ensure_index_fresh()
+    q = q.strip().lower()
+    files: list[dict[str, Any]] = []
+    nodes: list[dict[str, Any]] = []
+    if not q:
+        return {"q": q, "files": files, "nodes": nodes}
+    model_files = S3_INDEX.get("models", {}).get("files", {})
+    for rel, rec in model_files.items():
+        if q in rel.lower():
+            files.append({
+                "kind": "file",
+                "name": rel.split("/")[-1],
+                "rel": rel,
+                "folder": rec.get("folder"),
+                "s3": rec.get("s3_url"),
+                "bytes": rec.get("bytes"),
+            })
+            if len(files) >= limit:
+                break
+    for pkg in S3_INDEX.get("nodes", {}).get("packages", []):
+        if q in pkg.lower():
+            nodes.append({
+                "kind": "folder",
+                "name": pkg,
+                "s3": node_s3_url(pkg),
+            })
+            if len(nodes) >= limit:
+                break
+    # shortest path first → closest/most-relevant match on top
+    files.sort(key=lambda f: len(f["rel"]))
+    nodes.sort(key=lambda n: len(n["name"]))
+    return {"q": q, "files": files, "nodes": nodes}
+
+
 class SyncItem(BaseModel):
     s3_source: str
     local_dest: str
