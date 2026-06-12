@@ -1467,7 +1467,11 @@ def index():
 
 def main():
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8765)
+    # Port is env-configurable so it can match whatever the pod exposes
+    # (e.g. RunPod HTTP service on 8084). APP_PORT wins, then PORT, else 8765.
+    port = int(os.environ.get("APP_PORT") or os.environ.get("PORT") or "8765")
+    host = os.environ.get("APP_HOST", "0.0.0.0")
+    uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":
