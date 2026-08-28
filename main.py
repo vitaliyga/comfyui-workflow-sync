@@ -502,6 +502,15 @@ def _lookup_model(filename: str, hints: tuple[str, ...] = ()) -> dict | None:
     matches = by_bn.get(bn, [])
     if not matches:
         return None
+    # The widget value may carry a subpath inside the model folder
+    # ("prod/Ada.safetensors" → models/loras/prod/Ada.safetensors). ComfyUI
+    # loads exactly that relative path, so a candidate whose key ends with it
+    # IS the referenced file — without this, the basename fallback silently
+    # swaps a nested lora for its same-named sibling at the folder root.
+    if "/" in fn:
+        sub = [m for m in matches if m.endswith("/" + fn)]
+        if sub:
+            matches = sub
     if len(matches) == 1:
         return {"rel": matches[0], **files[matches[0]]}
     # ambiguous basename (same file lives in several folders, e.g. a VAE
@@ -510,8 +519,10 @@ def _lookup_model(filename: str, hints: tuple[str, ...] = ()) -> dict | None:
     if hints:
         pref = [m for m in matches if _folder_matches(files[m]["folder"], hints)]
         if pref:
-            # deterministic when >1 still match: shortest folder = most specific
-            best = min(pref, key=lambda m: (len(files[m]["folder"]), files[m]["folder"]))
+            # still >1 (root + nested copy with the same name): a flat widget
+            # value means the file at the folder root in ComfyUI, so fewest
+            # path segments wins; remaining ties break lexicographically.
+            best = min(pref, key=lambda m: (m.count("/"), len(m), m))
             return {"rel": best, **files[best]}
     return None
 
@@ -952,6 +963,7 @@ async def status(refresh: bool = False):
     idx = S3_INDEX
     return {
         "comfyui_path": str(COMFY),
+        "s3_models_base": S3_MODELS_BASE,
         "models": models,
         "custom_nodes": nodes,
         "disk_free": free,

@@ -865,12 +865,14 @@ function applyOverride(rowKind, originalIdx, picked) {
   if (rowKind === 'model' && picked.kind === 'file') {
     const parts = picked.s3.split('/');
     const filename = parts[parts.length - 1];
-    // best-effort: drop into models/<folder>/<file> where <folder> is the last
-    // path segment before the file
-    const folder = parts[parts.length - 2] || 'misc';
+    // preserve the full path under the models base (loras/prod/X → models/
+    // loras/prod/X); fall back to the last folder segment for files picked
+    // outside that tree
+    const rel = modelRelFromBase(picked.s3);
+    const folder = rel ? rel.split('/')[0] : (parts[parts.length - 2] || 'misc');
     row.folder = folder;
-    row.file = filename;
-    row.local_path = lastStatus.comfyui_path + '/models/' + folder + '/' + filename;
+    row.file = rel ? rel.slice(folder.length + 1) : filename;
+    row.local_path = lastStatus.comfyui_path + '/models/' + (rel || folder + '/' + filename);
     row.exists_locally = false;
   }
   if (rowKind === 'node' && picked.kind === 'folder') {
@@ -890,19 +892,30 @@ function applyOverride(rowKind, originalIdx, picked) {
 let lastStatus = { comfyui_path: '/workspace/ComfyUI' };
 fetch('/status').then(r=>r.json()).then(s => { lastStatus = s; });
 
+// Path of a picked model file relative to the S3 models base — keeps nested
+// folders intact (s3://…/models/loras/prod/X → "loras/prod/X"). Null when the
+// file is outside the models tree or sits directly at the base (no folder).
+function modelRelFromBase(s3) {
+  const base = lastStatus.s3_models_base;
+  if (!base || !s3.startsWith(base + '/')) return null;
+  const rel = s3.slice(base.length + 1);
+  return rel.includes('/') ? rel : null;
+}
+
 // ---- "+ Add path" button ----
 document.getElementById('add-row-btn').addEventListener('click', () => {
   openPicker('any', null, picked => {
     if (picked.kind === 'file') {
       const parts = picked.s3.split('/');
       const filename = parts[parts.length - 1];
-      const folder = parts[parts.length - 2] || 'misc';
+      const rel = modelRelFromBase(picked.s3);
+      const folder = rel ? rel.split('/')[0] : (parts[parts.length - 2] || 'misc');
       customRows.push({
         kind: 'model',
         s3_source: picked.s3,
-        local_dest: `${lastStatus.comfyui_path}/models/${folder}/${filename}`,
+        local_dest: `${lastStatus.comfyui_path}/models/${rel || folder + '/' + filename}`,
         bytes: picked.bytes,
-        file: filename, folder,
+        file: rel ? rel.slice(folder.length + 1) : filename, folder,
       });
     } else {
       const parts = picked.s3.replace(/\/$/,'').split('/');
