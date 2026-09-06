@@ -1,0 +1,10 @@
+{
+  "name": "comfyui-workflow-sync-a5c",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "description": "Babysitter orchestration workspace for comfyui-workflow-sync. Holds process definitions and the SDK used to author them. Not part of the Python application.",
+  "dependencies": {
+    "@a5c-ai/babysitter-sdk": "latest"
+  }
+}
